@@ -1,0 +1,9 @@
+## Interface: 110207, 120000, 120001
+## Version: 1.1.1
+## Title: Move Event Toast
+## Notes: Super lightweight addon that moves/clickthrough/disables the Event Toast window, type /moveet for instructions.
+## Author: railander
+## X-Curse-Project-ID: 1078647
+## SavedVariables: Move_Event_Toast
+
+Move_Event_Toast.lua
