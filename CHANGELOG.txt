@@ -1,0 +1,4 @@
+# Move Event Toast
+
+## 1.1.4
+- Attempting to fix autopackaging changelog
