@@ -1,5 +1,4 @@
 package-as: Move_Event_Toast
-manual-changelog: CHANGELOG.txt
 enable-nolib-creation: no
 
 ignore:
