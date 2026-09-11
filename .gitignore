@@ -1,0 +1,13 @@
+CF_API_KEY.txt
+*.key
+*.pem
+*.pfx
+.env
+.env.*
+*token*
+secret*
+
+# local UI source dumps live at the workspace root, never inside a repo
+source/
+
+.codegraph/
