@@ -19,16 +19,21 @@
 -- opens the config window (with a move mode that makes the toast spot
 -- drag-movable), /moveet reset restores the defaults.
 --
--- Midnight (12.x) restriction discipline: while any addon restriction is
--- active (Combat/Encounter/ChallengeMode/PvPMatch/Map/Chat -- rated PvP and
--- Mythic+ hold them out of combat, so the combat flag alone is the wrong
--- check) every gated call (SetPoint, EnableMouse, SetScript/HookScript,
--- RegisterEvent, even anchor reads like GetPoint) silently refuses or queues
--- instead of attempting, active drags cancel, and a /reload landing
--- mid-protection defers all gated setup until the lift is confirmed
--- out-of-dispatch. Safe while locked and never guarded: SetAlpha
--- (AllowedWhenTainted) and Show/Hide (house rule 3 -- sim-clean, sealed
--- in game like every other addon here).
+-- Midnight (12.x) gate discipline, retail flavor only: there is none. Tainted
+-- calls on secret-clean objects serve under any restriction state
+-- (live-verified 2026-09-12 on the sibling movers, all six types forced:
+-- drags, settings, strata writes, installs, all clean), and nothing this
+-- addon touches can become secret-marked (it ingests no unit/combat/aura
+-- data -- toast chrome only; Blizzard doesn't mark chrome). So every op
+-- below just attempts -- no flag checks, no mark checks, no pcall, no
+-- read-back verification, no queues. If the engine ever refuses, it errors
+-- LOUDLY (Bugsack, not silence), which is exactly what we want: a silent
+-- queue would hide the bug forever, an error gets reported and fixed. The
+-- only guards left are crash-safety (nil results abort geometry) and
+-- correctness (the already-there early-out keeps default settings from
+-- touching Blizzard's anchors at all, once-semantics for capture/hooks).
+-- Chat tutorial prints best-effort always (a swallowed line under Chat
+-- lockdown is harmless -- it is never load-bearing).
 
 local ADDON_NAME = "Move_Event_Toast";
 
@@ -53,7 +58,7 @@ local function MoveET_instructions()
 end
 
 -- the game's own placement (EventToastManager.xml: TOP 0 -190), used until
--- the stock layout is captured while clear and as the reset target
+-- the stock layout is captured once at init and as the reset target
 local STOCK_X, STOCK_Y = 0, -190;
 local MAX_COORD = 100000;
 local BOX_W, BOX_H = 418, 72; -- the manager's fixedWidth/minimumHeight from the XML
@@ -70,32 +75,21 @@ end
 local db; -- alias for the Move_Event_Toast SavedVariables table, set on ADDON_LOADED
 local options, refreshWindow; -- config window and its refresher, built below
 
--- Restriction state (Midnight 12.x). Declared HERE, above every function
--- that reads or writes them: Lua upvalues bind at closure creation, so a
--- later `local` would leave earlier paths writing to a same-named global
--- instead. Classic flavors never lock (no gate system -- the queries below
--- always read false there), so one code path serves all.
-local MoveET_restrictionsActive = false;
-local MoveET_restrictedTypes = {}; -- per-type marks from ADDON_RESTRICTION_STATE_CHANGED payloads
-local MoveET_gatedInitDeferred = false;
-local MoveET_stateLoaded = false; -- db backfilled (pure Lua, safe anytime)
-local MoveET_initDone = false; -- gated apply finished (capture/build/position/hooks)
-local MoveET_hooksInstalled = false; -- OnShow post-hook (HookScript is gated)
-local MoveET_captured = false; -- stock placement + anchor methods captured while clear
-local MoveET_anchored = false; -- the manager's own anchor methods are no-ops (MFC lock)
-local MoveET_pendingPosition = false; -- position re-apply skipped while locked
-local MoveET_pendingClickable = false; -- mouse-state apply skipped while locked
-local MoveET_pendingGreet = false; -- first-run tutorial skipped while locked (chat is best-effort)
-local MoveET_pendingWin = false; -- options-window re-anchor skipped while locked
+-- Install state. Declared HERE, above every function that reads or writes
+-- them: Lua upvalues bind at closure creation, so a later `local` would
+-- leave earlier paths writing to a same-named global instead.
+local MoveET_stateLoaded = false; -- db backfilled (pure Lua, always runs)
+local MoveET_hooksInstalled = false; -- post-hook attempted once (HookScript chains)
+local MoveET_captured = false; -- stock captured once (recapturing would adopt our moves)
+local MoveET_anchored = false; -- the manager's own anchor methods are no-ops (placement lock)
 local MoveET_moveModeOn = false; -- move mode: the green box + drag input are shown
 local MoveET_moveDragging = false; -- a drag gesture is in flight (OnUpdate early-returns without it)
 local MoveET_moveBox; -- green 50% box over the toast spot, marking its rect
 local MoveET_moveInput; -- transparent drag input above the spot
 local MoveET_grabDX, MoveET_grabDY; -- cursor offset from the anchor point at grab time
--- Forward declarations: assigned further below, called from early restriction
--- paths and mid-file appliers (bound here so they resolve correctly).
-local MoveET_EnsureGatedInit;
-local MoveET_FlushPending;
+-- Forward declarations: assigned further below, called from early paths and
+-- mid-file appliers (bound here so they resolve correctly).
+local MoveET_EnsureInit;
 local MoveET_RegisterAddonEvents;
 local MoveET_DetachDrag;
 local MoveET_DragUpdate;
@@ -103,149 +97,41 @@ local MoveET_SetMoveMode;
 local MoveET_BeginDrag;
 local MoveET_EndDrag;
 local MoveET_SyncMoveBox;
-local MoveET_IsInteractionLocked;
 local MoveET_EventFrame; -- listener frame, created at file load below
 
--- stock layout, captured while clear (every read below is gated, so
--- capturing defers as one with the rest of gated init)
+-- stock layout, captured once at init (recapturing later would adopt our
+-- own moves as the game's)
 local stockX, stockY = STOCK_X, STOCK_Y; -- the game's own toast placement
 -- the manager's own anchor methods, kept privately once captured: every
 -- apply below goes through these, so the no-op lock never blocks us
 local origClear, origSetPoint;
 
 -- Capture the stock layout: the game's own placement plus the anchor
--- methods the lock later swaps out. Gated reads (GetPoint most of all), so
--- this runs only while clear, inside gated init.
+-- methods the lock later swaps out. Runs once (stock must predate our own
+-- moves -- recapturing later would adopt our offset as the game's).
 local function MoveET_CaptureStock()
 	if MoveET_captured then
 		return;
 	end
 	origClear, origSetPoint = manager.ClearAllPoints, manager.SetPoint;
-	local ok, point, relativeTo, relativePoint, x, y = pcall(manager.GetPoint, manager, 1);
-	if ok and x ~= nil and y ~= nil then
+	local _, _, _, x, y = manager:GetPoint(1);
+	if x ~= nil and y ~= nil then
 		stockX, stockY = MoveET_Round2(x), MoveET_Round2(y);
 	end
 	MoveET_captured = true;
 end
 
 -- ----------------------------------------------------------------------------
--- Restriction state (Midnight 12.x): lock taint-able work while protected
--- ----------------------------------------------------------------------------
--- Six restriction types (Enum.AddOnRestrictionType, identical in every dump):
--- Combat, Encounter, ChallengeMode (M+), PvPMatch, Map, Chat. While ANY type
--- is active, gated calls from addon execution fail silently -- so while
--- locked this addon refuses or queues instead of attempting: every applier
--- below checks the lock FIRST (before even its gated reads like GetPoint)
--- and remembers the work for the lift. Chat notices never emit on lock paths
--- (they neither render while protected nor get read in combat -- blocked
--- input just does nothing). Safe while locked and never guarded: SetAlpha,
--- Show/Hide, db table work.
-local MoveET_RESTRICTION_FALLBACK = { 0, 1, 2, 3, 4, 5 }; -- Combat..Chat
-local MoveET_RESTRICTION_STATE = { inactive = 0, activating = 1, active = 2 };
-
-local function MoveET_RestrictionTypeIDs()
-	if Enum and Enum.AddOnRestrictionType then
-		local t = Enum.AddOnRestrictionType;
-		local out = {};
-		for _, id in ipairs({ t.Combat, t.Encounter, t.ChallengeMode, t.PvPMatch, t.Map, t.Chat }) do
-			if id ~= nil then
-				out[#out + 1] = id;
-			end
-		end
-		if #out > 0 then
-			return out;
-		end
-	end
-	return MoveET_RESTRICTION_FALLBACK;
-end
-
-local function MoveET_RestrictionStateID(name)
-	if Enum and Enum.AddOnRestrictionState and Enum.AddOnRestrictionState[name] ~= nil then
-		return Enum.AddOnRestrictionState[name];
-	end
-	return MoveET_RESTRICTION_STATE[name];
-end
-
--- Full all-types query. Must NEVER run during ADDON_RESTRICTION_STATE_CHANGED
--- dispatch (IsAddOnRestrictionActive reads false there by design); that
--- handler maintains per-type marks from the payload instead.
-local function MoveET_AreRestrictionsActive()
-	if C_RestrictedActions and C_RestrictedActions.IsAddOnRestrictionActive then
-		for _, rtype in ipairs(MoveET_RestrictionTypeIDs()) do
-			local ok, active = pcall(C_RestrictedActions.IsAddOnRestrictionActive, rtype);
-			if ok and active then
-				return true;
-			end
-		end
-		return false;
-	end
-	if InCombatLockdown then
-		return InCombatLockdown() and true or false;
-	end
-	return false;
-end
-
--- Live check: the latched flag covers dispatch windows where the query reads
--- false by design; the query covers events missed while a registration was
--- down. Either side locks. Callers are input/event-driven (never per-frame),
--- so the handful of pcall'd queries per gesture is negligible.
-MoveET_IsInteractionLocked = function()
-	return MoveET_restrictionsActive or MoveET_AreRestrictionsActive();
-end
-
-local function MoveET_ApplyRestrictionsActive()
-	MoveET_restrictionsActive = true;
-	-- end an in-flight drag without touching gates: the flag stops the
-	-- OnUpdate (hidden frames tick nothing anyway) and the detach below is
-	-- best-effort -- while enforced it stays as a nil-cost early-return until
-	-- the next unrestricted stop or lift detaches it. The box itself stays
-	-- put: the manager cannot move either, so it stays accurate.
-	MoveET_moveDragging = false;
-	MoveET_DetachDrag();
-end
-
-local function MoveET_ApplyRestrictionsCleared()
-	MoveET_restrictionsActive = false;
-	for k in pairs(MoveET_restrictedTypes) do
-		MoveET_restrictedTypes[k] = nil;
-	end
-	MoveET_EnsureGatedInit();
-end
-
--- Re-query outside event dispatch; clears the lock only when every type is idle.
-local function MoveET_ConfirmRestrictionsCleared()
-	if not MoveET_AreRestrictionsActive() then
-		MoveET_ApplyRestrictionsCleared();
-	end
-end
-
--- Re-query and apply whichever side is true. Both sides are silent. The clear
--- side is cheap when there is nothing to resume: only a lock episode, a
--- deferred init, queued work, or a never-finished init runs the full resume.
-local function MoveET_RefreshRestrictionState()
-	if MoveET_AreRestrictionsActive() then
-		MoveET_ApplyRestrictionsActive();
-		return true;
-	end
-	if MoveET_restrictionsActive or MoveET_gatedInitDeferred or not MoveET_initDone
-		or MoveET_pendingPosition or MoveET_pendingClickable then
-		MoveET_ApplyRestrictionsCleared();
-	end
-	return false;
-end
-
--- ----------------------------------------------------------------------------
--- core behavior: every applier checks the lock FIRST (before even its gated
--- reads) and queues instead of attempting, so a call from any path -- hooks,
--- slash, options, lift flush -- is safe by construction
+-- core behavior: every op below just attempts. A call from any path --
+-- hooks, slash, options, events -- runs the same straight-line code; there
+-- is no lock state, no queue, nothing to flush
 -- ----------------------------------------------------------------------------
 
 -- While positioned, the manager's own anchor methods are no-ops so neither
 -- Blizzard's UpdateAnchor (every DisplayToast resets to TOP 0 -190) nor any
 -- other toast mover can displace it behind our back; our own applies go
--- through the privately kept originals. The no-ops make no gated calls
--- themselves, so a Blizzard re-anchor landing mid-protection simply does
--- nothing instead of failing.
+-- through the privately kept originals. This is a placement lock, not a
+-- restriction gate: the swap itself is plain Lua field writes.
 local function MoveET_SetLocked(locked)
 	if locked == MoveET_anchored or not MoveET_captured then
 		return;
@@ -260,15 +146,20 @@ local function MoveET_SetLocked(locked)
 	end
 end
 
--- Re-apply the saved position over the manager's current anchor. GetPoint is
--- gated: while locked the Blizzard anchor (already ours, via the lock)
--- stands until the lift flush.
+-- Re-apply the saved position over the manager's current anchor. A nil read
+-- means the engine refused to answer: abort without touching anything (the
+-- next organic trigger retries). An already-there anchor is left completely
+-- alone, so default settings never touch Blizzard's anchors at all.
 local function MoveET_ApplyPosition()
 	if not db or not MoveET_captured then
 		return;
 	end
-	if MoveET_IsInteractionLocked() then
-		MoveET_pendingPosition = true;
+	local _, _, _, x, y = manager:GetPoint(1);
+	if x == nil or y == nil then
+		return;
+	end
+	if x == db.x and y == db.y then
+		-- already exactly there: leave Blizzard's anchor completely alone
 		return;
 	end
 	origClear(manager);
@@ -277,14 +168,8 @@ end
 
 -- Apply the mouse state to the manager and whichever toast is currently
 -- pooled: clickthrough (or disable) means nothing here intercepts clicks.
--- EnableMouse is NotAllowed-gated, so while locked the current state stands
--- and the apply queues for the lift.
 local function MoveET_ApplyClickable()
 	if not db or not MoveET_captured then
-		return;
-	end
-	if MoveET_IsInteractionLocked() then
-		MoveET_pendingClickable = true;
 		return;
 	end
 	local enabled = (not db.clickthrough) and (not db.disable);
@@ -303,10 +188,9 @@ local function MoveET_ApplyClickable()
 	end
 end
 
--- Apply the disable switch. SetAlpha is AllowedWhenTainted (visual-only,
--- safe even mid-protection); hiding is ungated per house rule 3, so a
--- disable lands instantly even while locked and a toast arriving while
--- disabled is re-hidden by the OnShow post-hook below.
+-- Apply the disable switch: a disabled manager is faded out and hidden, and
+-- a toast arriving while disabled is re-hidden by the OnShow post-hook
+-- below. SetAlpha is the designated secret-display sink and always lands.
 local function MoveET_ApplyDisable()
 	if not db or not MoveET_captured then
 		return;
@@ -317,13 +201,12 @@ local function MoveET_ApplyDisable()
 	else
 		manager:SetAlpha(1);
 	end
-	MoveET_ApplyClickable(); -- queues itself while locked
+	MoveET_ApplyClickable();
 end
 
 -- Fired after Blizzard's own display work: every DisplayToast ends in
--- Show-or-Hide, so this post-hook sees each newly pooled toast. It runs
--- inside Blizzard's call chain, so its body is restricted to the safe set
--- plus self-guarding appliers (which queue while locked).
+-- Show-or-Hide through Blizzard's own execution, then ours re-applies the
+-- saved position and the per-toast mouse state.
 local function MoveET_OnManagerShow()
 	MoveET_ApplyPosition();
 	if db and db.disable then
@@ -333,9 +216,8 @@ local function MoveET_OnManagerShow()
 end
 
 -- restore every setting to the game's own behavior (db work is pure Lua and
--- always lands; the applies queue themselves while locked). Every saved
--- value goes back, including the config window's own position -- as if the
--- addon was never enabled.
+-- always lands). Every saved value goes back, including the config window's
+-- own position -- as if the addon was never enabled.
 local function MoveET_Reset()
 	if not db then
 		return;
@@ -344,21 +226,17 @@ local function MoveET_Reset()
 	db.clickthrough, db.disable = false, false;
 	db.win = { x = 0, y = 0 };
 	MoveET_ApplyPosition(); -- restores the game's own placement
-	MoveET_ApplyDisable(); -- alpha back to 1, mouse back on (queued while locked)
+	MoveET_ApplyDisable(); -- alpha back to 1, mouse back on
 	-- note: reset touches values only -- the window stays open and move mode
 	-- stays on (the box follows the reset spot through refreshWindow below)
 	if options then
-		if MoveET_IsInteractionLocked() then
-			MoveET_pendingWin = true;
-		else
-			options:ClearAllPoints();
-			options:SetPoint("CENTER", UIParent, "CENTER", 0, 0);
-		end
+		options:ClearAllPoints();
+		options:SetPoint("CENTER", UIParent, "CENTER", 0, 0);
 	end
 	if refreshWindow then
 		refreshWindow(); -- the window (and the move box) follows the reset
 	end
-	if options and options.xBox and not MoveET_IsInteractionLocked() then
+	if options and options.xBox then
 		-- force the boxes: they may hold keyboard focus or a format-equal
 		-- string ("-190.0") that the conditional refresh skips, leaving
 		-- stale visible text on the real client
@@ -402,11 +280,9 @@ end
 -- active and is removed on release, so there is no per-frame cost outside
 -- of it.
 
--- Best-effort OnUpdate detach: the script needs gates, so while locked it
--- stays as a nil-cost early-return (hidden frames tick nothing anyway) until
--- the next unrestricted stop or lift detaches it.
+-- Best-effort OnUpdate detach on our own input frame: always safe.
 MoveET_DetachDrag = function()
-	if MoveET_moveInput and not MoveET_IsInteractionLocked() then
+	if MoveET_moveInput then
 		MoveET_moveInput:SetScript("OnUpdate", nil);
 	end
 end;
@@ -447,14 +323,17 @@ MoveET_BeginDrag = function(self)
 	if not db or not MoveET_moveModeOn then
 		return;
 	end
-	if MoveET_IsInteractionLocked() then
-		return; -- silently refuse: blocked input just does nothing
-	end
 	-- capture where the cursor grabbed relative to the anchor point: db
 	-- already IS the TOP anchor's offset in UI units, so the grab is exact
 	-- and the spot cannot jump by a single pixel, whatever the scale
 	local pw, ph = UIParent:GetSize();
+	if pw == nil or ph == nil then
+		return;
+	end
 	local cx, cy = GetCursorPosition(); -- already in UI units on this client
+	if cx == nil or cy == nil then
+		return; -- cursor unreadable: refuse the grab without touching anything
+	end
 	MoveET_grabDX = cx - (pw / 2 + db.x);
 	MoveET_grabDY = cy - (ph + db.y);
 	MoveET_moveDragging = true;
@@ -464,21 +343,17 @@ MoveET_BeginDrag = function(self)
 end;
 
 MoveET_EndDrag = function(self)
-	if MoveET_moveDragging and not MoveET_IsInteractionLocked() then
+	if MoveET_moveDragging then
 		MoveET_DragUpdate(); -- exact final position (drag still active)
 	end
 	MoveET_moveDragging = false;
 	MoveET_DetachDrag();
 end;
 
--- Re-anchor the box and the input over the saved spot. Gated throughout
--- (SetPoint): callers ensure a clear context, and the guard below keeps it
--- safe by construction anyway.
+-- Re-anchor the box and the input over the saved spot. Both are our own
+-- frames, so this always serves.
 MoveET_SyncMoveBox = function()
 	if not MoveET_moveBox or not db then
-		return;
-	end
-	if MoveET_IsInteractionLocked() then
 		return;
 	end
 	MoveET_moveBox:ClearAllPoints();
@@ -491,21 +366,21 @@ end;
 
 MoveET_DragUpdate = function()
 	if not MoveET_moveDragging then
-		return; -- idle frame: return before the lock query (nil per-frame cost)
+		return; -- idle frame: cheapest possible return, no queries at all
 	end
 	if not db then
 		MoveET_moveDragging = false;
 		return;
 	end
-	if MoveET_IsInteractionLocked() then
-		-- protection landed mid-drag: end the gesture without persisting
-		-- anything further (db keeps the pre-lock spot for the part after).
+	local pw, ph = UIParent:GetSize();
+	local cx, cy = GetCursorPosition(); -- already in UI units on this client
+	if pw == nil or ph == nil or cx == nil or cy == nil then
+		-- cursor unreadable mid-drag: end the gesture without persisting
+		-- anything further (db keeps the last good spot)
 		MoveET_moveDragging = false;
 		MoveET_DetachDrag();
 		return;
 	end
-	local pw, ph = UIParent:GetSize();
-	local cx, cy = GetCursorPosition(); -- already in UI units on this client
 	db.x = MoveET_Round2(cx - MoveET_grabDX - pw / 2);
 	db.y = MoveET_Round2(cy - MoveET_grabDY - ph);
 	MoveET_ApplyPosition();
@@ -517,9 +392,6 @@ end;
 
 MoveET_SetMoveMode = function(on)
 	if on then
-		if MoveET_IsInteractionLocked() then
-			return; -- move mode needs gated installs/anchors: leave it off while locked
-		end
 		MoveET_BuildMoveUI();
 		if not MoveET_moveBox then
 			return;
@@ -529,8 +401,7 @@ MoveET_SetMoveMode = function(on)
 		MoveET_moveInput:Show();
 		MoveET_moveModeOn = true;
 	else
-		-- exiting is always safe: Hide is ungated and the detach/label below
-		-- guard themselves, so move mode can be left even while locked
+		-- exiting is always safe
 		MoveET_moveModeOn = false;
 		MoveET_moveDragging = false;
 		MoveET_DetachDrag();
@@ -541,15 +412,13 @@ MoveET_SetMoveMode = function(on)
 			MoveET_moveInput:Hide();
 		end
 	end
-	if options and options.moveBtn and not MoveET_IsInteractionLocked() then
-		-- Button:SetText is gated: refresh the label only when clear (the
-		-- lift flush re-syncs it through refreshWindow)
+	if options and options.moveBtn then
 		options.moveBtn:SetText(MoveET_moveModeOn and "stop moving" or "move toast");
 	end
 end;
 
 -- ----------------------------------------------------------------------------
--- config window, built on gated init inside a pcall: even if a widget template
+-- config window, built on init inside a pcall: even if a widget template
 -- is missing in some client build, the toast positioning keeps working
 -- ----------------------------------------------------------------------------
 local function MoveET_MakeLabel(parent, text, fontObject, point, relativeTo, relPoint, x, y)
@@ -596,19 +465,16 @@ local function MoveET_BuildWindow()
 	options:RegisterForDrag("LeftButton");
 	options:SetClampedToScreen(true);
 	options:SetScript("OnDragStart", function(self)
-		if MoveET_IsInteractionLocked() then
-			return; -- StartMoving is gated: the window stays put while protected
-		end
-		self:StartMoving();
+		self:StartMoving(); -- own frame: always servable
 	end);
 	options:SetScript("OnDragStop", function(self)
-		if MoveET_IsInteractionLocked() then
-			return; -- StopMovingOrSizing + re-anchor are gated; position unsaved
-		end
 		self:StopMovingOrSizing();
 		if db then
 			local pw, ph = UIParent:GetSize();
 			local cx, cy = self:GetCenter();
+			if pw == nil or ph == nil or cx == nil or cy == nil then
+				return;
+			end
 			db.win = { x = MoveET_Round2(cx - pw / 2), y = MoveET_Round2(cy - ph / 2) };
 			self:ClearAllPoints();
 			self:SetPoint("CENTER", UIParent, "CENTER", db.win.x, db.win.y);
@@ -667,9 +533,9 @@ local function MoveET_BuildWindow()
 	options.moveBtn:SetPoint("TOP", options, "TOP", 0, -6);
 	options.moveBtn:SetScript("OnClick", function()
 		if MoveET_moveModeOn then
-			MoveET_SetMoveMode(false); -- exiting is always safe, even while locked
+			MoveET_SetMoveMode(false);
 		else
-			MoveET_SetMoveMode(true); -- entering refuses silently while locked
+			MoveET_SetMoveMode(true);
 		end
 	end);
 
@@ -679,7 +545,7 @@ local function MoveET_BuildWindow()
 		v = tonumber(v);
 		if v and v >= -MAX_COORD and v <= MAX_COORD then
 			db.x = MoveET_Round2(v);
-			MoveET_ApplyPosition(); -- queues itself while locked (db already correct)
+			MoveET_ApplyPosition(); -- db already correct, frame follows
 			if refreshWindow then
 				refreshWindow();
 			end
@@ -690,7 +556,7 @@ local function MoveET_BuildWindow()
 		v = tonumber(v);
 		if v and v >= -MAX_COORD and v <= MAX_COORD then
 			db.y = MoveET_Round2(v);
-			MoveET_ApplyPosition(); -- queues itself while locked (db already correct)
+			MoveET_ApplyPosition(); -- db already correct, frame follows
 			if refreshWindow then
 				refreshWindow();
 			end
@@ -708,7 +574,7 @@ local function MoveET_BuildWindow()
 			return;
 		end
 		db.clickthrough = self:GetChecked() and true or false;
-		MoveET_ApplyClickable(); -- queues itself while locked (db already correct)
+		MoveET_ApplyClickable(); -- db already correct, frame follows
 	end);
 
 	-- disable: no toasts at all while set
@@ -721,16 +587,14 @@ local function MoveET_BuildWindow()
 			return;
 		end
 		db.disable = self:GetChecked() and true or false;
-		MoveET_ApplyDisable(); -- queues itself while locked (db already correct)
+		MoveET_ApplyDisable(); -- db already correct, frame follows
 	end);
 
 	function refreshWindow()
 		if not db or not options.xBox then
 			return;
 		end
-		if MoveET_IsInteractionLocked() then
-			return; -- EditBox/Button/CheckButton writes are gated: refresh on lift
-		end
+		-- own frames throughout: every write below serves.
 		if tonumber(options.xBox:GetText()) ~= db.x then
 			options.xBox:SetText(tostring(db.x));
 		end
@@ -760,13 +624,14 @@ local function MoveET_BuildWindow()
 end
 
 -- ----------------------------------------------------------------------------
--- Load (pure Lua, safe anytime) vs gated init (deferred while protected)
+-- Load (pure Lua, always) + init (attempt everything at file scope, on load,
+-- and on slash)
 -- ----------------------------------------------------------------------------
 
--- Backfill the db from SavedVariables. Pure Lua table work only: safe under
--- any restriction, so a /reload-in-combat still lands its state and only the
--- gated apply waits for the lift. Returns false on a missing manager (inert
--- before touching SavedVariables). Idempotent.
+-- Backfill the db from SavedVariables. Pure Lua table work only. Returns
+-- false on a missing manager (inert before touching SavedVariables).
+-- Idempotent. The first-run tutorial prints best-effort, chat lockdown or
+-- not -- it is never load-bearing.
 local function MoveET_LoadState()
 	if MoveET_stateLoaded then
 		return true;
@@ -783,73 +648,32 @@ local function MoveET_LoadState()
 	end
 	MoveET_Sanitize(db);
 	if freshDB then
-		if MoveET_IsInteractionLocked() then
-			MoveET_pendingGreet = true; -- chat is best-effort: greet on lift
-		else
-			MoveET_instructions();
-		end
+		MoveET_instructions();
 	end
 	MoveET_stateLoaded = true;
 	return true;
 end
 
--- Flush work queued while locked. Runs only when clear.
-MoveET_FlushPending = function()
-	if not MoveET_stateLoaded or MoveET_IsInteractionLocked() then
-		return;
-	end
-	if MoveET_pendingGreet then
-		MoveET_pendingGreet = false;
-		MoveET_instructions();
-	end
-	if MoveET_pendingPosition then
-		MoveET_pendingPosition = false;
-		MoveET_ApplyPosition();
-	end
-	if MoveET_pendingClickable then
-		MoveET_pendingClickable = false;
-		MoveET_ApplyDisable(); -- re-runs alpha/hide plus the mouse state
-	end
-	if MoveET_pendingWin then
-		MoveET_pendingWin = false;
-		if options then
-			options:ClearAllPoints();
-			options:SetPoint("CENTER", UIParent, "CENTER", db.win.x, db.win.y);
-		end
-	end
-	if MoveET_moveModeOn then
-		MoveET_SyncMoveBox(); -- a locked rebuild may have moved the spot
-	end
-	if refreshWindow then
-		refreshWindow();
-	end
-end;
-
--- Install the display post-hook. HookScript is gated, so this runs only
--- while clear, inside gated init. The hook runs after Blizzard's own
--- display work: DisplayToast always ends in Show-or-Hide through Blizzard's
--- own untainted execution (which keeps working while locked), then ours
--- re-applies the saved position and the per-toast mouse state -- or queues
--- them while locked.
+-- Install the display post-hook. Attempted unconditionally; the hook runs
+-- after Blizzard's own display work: DisplayToast always ends in
+-- Show-or-Hide through Blizzard's own execution, then ours re-applies the
+-- saved position and the per-toast mouse state.
 local function MoveET_InstallHooks()
 	if MoveET_hooksInstalled then
 		return;
 	end
 	manager:HookScript("OnShow", MoveET_OnManagerShow);
+	-- installs are attempted once (HookScript chains, so repeats would stack
+	-- duplicate wrappers): if the engine ever refuses, it errors loudly and
+	-- we hear about it.
 	MoveET_hooksInstalled = true;
 end
 
--- Idempotent gated setup: captures the stock layout, (re)registers events,
--- builds the options window, installs the post-hook, locks the anchors and
--- runs the deferred login apply. Safe to call from any event or slash entry;
--- defers (and remembers) while protected so a /reload-in-combat never
--- half-installs silently.
-MoveET_EnsureGatedInit = function()
-	if MoveET_IsInteractionLocked() then
-		MoveET_gatedInitDeferred = true;
-		return false;
-	end
-	MoveET_gatedInitDeferred = false;
+-- Setup, run at file scope (pre-SV: registers, captures, hooks, builds)
+-- and again on ADDON_LOADED and slash (cheap idempotent re-entry:
+-- registration no-ops, capture/hooks run once, applies re-assert).
+-- The first apply waits for state (db guard below).
+MoveET_EnsureInit = function()
 	MoveET_RegisterAddonEvents();
 	MoveET_CaptureStock();
 	MoveET_InstallHooks();
@@ -858,7 +682,7 @@ MoveET_EnsureGatedInit = function()
 			MoveET_BuildWindow();
 		end);
 	end
-	if MoveET_stateLoaded and not MoveET_initDone then
+	if MoveET_stateLoaded then
 		MoveET_ApplyPosition(); -- positions over the login anchor
 		MoveET_ApplyDisable(); -- saved clickthrough/disable from the start
 		MoveET_SetLocked(true); -- Blizzard re-anchors stop here from now on
@@ -869,86 +693,42 @@ MoveET_EnsureGatedInit = function()
 				refreshWindow();
 			end
 		end
-		MoveET_initDone = true;
 	end
-	MoveET_FlushPending();
-	return true;
 end;
 
 -- ----------------------------------------------------------------------------
 -- login and persist through sessions functionality
 -- ----------------------------------------------------------------------------
-local function MoveET_OnEvent(self, event, arg1, arg2)
+local function MoveET_OnEvent(self, event, arg1)
 	if event == "ADDON_LOADED" then
 		if arg1 == ADDON_NAME then
-			-- UnregisterEvent is itself gated: skip while locked (the
-			-- handler is idempotent, a lingering registration is harmless).
-			if not MoveET_IsInteractionLocked() then
-				self:UnregisterEvent("ADDON_LOADED");
-			end
 			if MoveET_LoadState() then
-				MoveET_EnsureGatedInit();
+				MoveET_EnsureInit();
 			end
-		end
-	elseif event == "ADDON_RESTRICTION_STATE_CHANGED" then
-		-- Payload is (restrictionType, newState). IsAddOnRestrictionActive
-		-- reads FALSE during this dispatch by design, so never query here --
-		-- maintain per-type marks from the payload and confirm outside.
-		if arg2 == MoveET_RestrictionStateID("inactive") then
-			if arg1 ~= nil then MoveET_restrictedTypes[arg1] = nil; end
-			if next(MoveET_restrictedTypes) == nil then
-				if C_Timer and C_Timer.After then
-					C_Timer.After(0, MoveET_ConfirmRestrictionsCleared);
-				end
-			end
-		else
-			-- Activating (fired before enforcement starts), Active, or unknown.
-			if arg1 ~= nil then MoveET_restrictedTypes[arg1] = true; end
-			MoveET_ApplyRestrictionsActive();
-		end
-	elseif event == "PLAYER_REGEN_DISABLED" then
-		-- Entering combat: mark locked only if the query agrees. The lock
-		-- transition is silent by design.
-		MoveET_RefreshRestrictionState();
-	elseif event == "PLAYER_REGEN_ENABLED" then
-		-- Backstop wake-up: covers a restriction-changed registration missed
-		-- during a /reload-in-combat.
-		MoveET_RefreshRestrictionState();
-	elseif event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED" or event == "ZONE_CHANGED_NEW_AREA" then
-		-- Zone crossings (M+/rated maps restrict on entry, out of combat):
-		-- re-check protected status, re-assert the saved spot on lift.
-		MoveET_RefreshRestrictionState();
-		MoveET_ApplyPosition();
-		MoveET_ApplyDisable();
-		if MoveET_moveModeOn then
-			MoveET_SyncMoveBox(); -- zoning rebuilds the UI: box follows
+			-- unregister LAST: EnsureInit re-registers everything above,
+			-- so unsubscribing first would resurrect in the same tick.
+			-- The handler is idempotent anyway, so a lingering
+			-- registration would be harmless regardless.
+			self:UnregisterEvent("ADDON_LOADED");
 		end
 	end
 end
 
--- All event installs funnel through here so a deferred boot can retry them
--- idempotently once protection lifts. Re-registering is a no-op and the
--- script is simply replaced.
+-- All event installs funnel through here. Re-registering is a no-op and the
+-- script is simply replaced, so repeated EnsureInit calls stay cheap.
 local function MoveET_RegisterAddonEventsInner()
 	if not MoveET_EventFrame then return end
 	MoveET_EventFrame:RegisterEvent("ADDON_LOADED");
-	MoveET_EventFrame:RegisterEvent("ADDON_RESTRICTION_STATE_CHANGED");
-	MoveET_EventFrame:RegisterEvent("PLAYER_REGEN_DISABLED");
-	MoveET_EventFrame:RegisterEvent("PLAYER_REGEN_ENABLED");
-	MoveET_EventFrame:RegisterEvent("PLAYER_ENTERING_WORLD");
-	MoveET_EventFrame:RegisterEvent("ZONE_CHANGED");
-	MoveET_EventFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA");
 	MoveET_EventFrame:SetScript("OnEvent", MoveET_OnEvent);
 end
 MoveET_RegisterAddonEvents = MoveET_RegisterAddonEventsInner;
 
 MoveET_EventFrame = CreateFrame("Frame", "Move_Event_ToastEventFrame");
 
--- Boot-time restriction evaluation: a /reload landing mid-protection
--- silently defers all gated setup instead of half-installing. Recovery order
--- on lift: restriction-changed confirm, regen-enabled, zone re-check, next
--- slash use (lazy self-heal in the slash handler below).
-MoveET_EnsureGatedInit();
+-- File scope runs before SavedVariables land: register (so our own
+-- ADDON_LOADED is heard), capture stock, install hooks, build the window.
+-- The first apply waits for state in the ADDON_LOADED handler below.
+MoveET_EnsureInit();
 
 -- ----------------------------------------------------------------------------
 -- slash command functionality: bare /moveet (or anything unrecognized)
@@ -961,9 +741,9 @@ SlashCmdList.MOVEET = function(msg)
 			return; -- unknown layout: inert, SavedVariables untouched
 		end
 	end
-	-- self-heal: a missed ADDON_LOADED (deaf boot under protection) resumes
-	-- here once clear; no-op while locked.
-	MoveET_EnsureGatedInit();
+	-- re-entry is cheap and idempotent: a missed ADDON_LOADED (refused
+	-- registration) resumes here.
+	MoveET_EnsureInit();
 	if not db then
 		return; -- settings are not loaded yet
 	end

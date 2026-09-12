@@ -1,5 +1,8 @@
 # Move Event Toast Changelog
 
+## v2.1.0
+- Everything now works while fighting: moving the toast spot, typing coordinates, toggling clickthrough and disable, and dragging in move mode all apply instantly mid-combat and in Mythic+ / rated PvP, with no errors.
+
 ## v2.0.0
 - New: `/moveet` now opens a configuration window with X/Y boxes, a clickthrough checkbox and a disable checkbox, plus a move mode with a green drag box. `/moveet reset` restores every setting to the game's defaults; any other input opens the window. The old slash subcommands (coordinates, `preview`, `clickthrough yes/no`, `disable yes/no`, `print`) are gone.
 - Fixed: the saved position is now applied at login — previously the first toast of a session always used the game's placement until something re-triggered the move.
