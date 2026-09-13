@@ -18,7 +18,7 @@ Any other input opens the window as well.
 
 ## Compatibility
 
-Works on Modern (retail / Midnight).
+World of Warcraft: Midnight (12.1.0)
 
 ## Links
 
