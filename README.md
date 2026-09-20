@@ -19,6 +19,7 @@ Any other input opens the window as well.
 ## Compatibility
 
 - World of Warcraft: Midnight (12.1.0)
+- World of Warcraft: The War Within (11.2.7)
 
 ## Links
 

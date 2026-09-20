@@ -640,10 +640,10 @@ local function MoveET_LoadState()
 		return false;
 	end
 
-	local freshDB = _G[ADDON_NAME] == nil;
+	local freshDB = type(_G[ADDON_NAME]) ~= "table";
 	db = _G[ADDON_NAME];
-	if not db then
-		db = {}; -- start from the game's own placement
+	if freshDB then
+		db = {}; -- start from the game's own placement (also heals a corrupted non-table save)
 		_G[ADDON_NAME] = db; -- first session: publish it so it gets saved
 	end
 	MoveET_Sanitize(db);
@@ -716,12 +716,13 @@ end
 
 -- All event installs funnel through here. Re-registering is a no-op and the
 -- script is simply replaced, so repeated EnsureInit calls stay cheap.
-local function MoveET_RegisterAddonEventsInner()
+-- Assigned here (not a `local function`) because EnsureInit above calls it
+-- before this line runs; the forward declaration near the top binds the name.
+MoveET_RegisterAddonEvents = function()
 	if not MoveET_EventFrame then return end
 	MoveET_EventFrame:RegisterEvent("ADDON_LOADED");
 	MoveET_EventFrame:SetScript("OnEvent", MoveET_OnEvent);
-end
-MoveET_RegisterAddonEvents = MoveET_RegisterAddonEventsInner;
+end;
 
 MoveET_EventFrame = CreateFrame("Frame", "Move_Event_ToastEventFrame");
 
