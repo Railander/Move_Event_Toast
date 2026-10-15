@@ -1,5 +1,8 @@
 # Move Event Toast Changelog
 
+## v2.1.1
+- Event toasts now work in World of Warcraft: Midnight (12.1.5). Nothing changes in game.
+
 ## v2.1.0
 - Everything now works while fighting: moving the toast spot, typing coordinates, toggling clickthrough and disable, and dragging in move mode all apply instantly mid-combat and in Mythic+ / rated PvP, with no errors.
 
