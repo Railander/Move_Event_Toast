@@ -9,10 +9,12 @@
 -- custom offsets), and only there. Once positioned, the manager's own anchor
 -- methods become no-ops (the originals are kept privately and every apply
 -- goes through them), so no Blizzard re-anchor, UI reload pass or other
--- toast mover can displace it -- the MFC anchor-lock pattern. A post-hook on
--- the manager's OnShow (fired at the end of every DisplayToast, which always
--- ends in Show-or-Hide) re-applies the saved position and the clickthrough
--- state onto each newly pooled toast. There is zero hooksecurefunc anywhere:
+-- toast mover can displace it -- the MFC anchor-lock pattern. Post-hooks on
+-- the manager's OnShow (the first toast of a chain: the manager was hidden)
+-- and on its fastHide/hideAnim OnFinished (every chained toast: those run
+-- ToastingEnded -> DisplayToast while the manager stays shown, so OnShow
+-- never fires again) re-apply the saved position and the clickthrough state
+-- onto each newly pooled toast. There is zero hooksecurefunc anywhere:
 -- hooking Blizzard's DisplayToast Lua method would taint Blizzard's own
 -- toast path and degrade restricted calls made from it while protected.
 -- Everything is event driven: no polling and no per-frame code. /moveet
@@ -87,6 +89,10 @@ local MoveET_moveDragging = false; -- a drag gesture is in flight (OnUpdate earl
 local MoveET_moveBox; -- green 50% box over the toast spot, marking its rect
 local MoveET_moveInput; -- transparent drag input above the spot
 local MoveET_grabDX, MoveET_grabDY; -- cursor offset from the anchor point at grab time
+-- each frame's own mouse state, read before our first write: re-enabling
+-- restores it (stock toast bodies are NOT mouse-enabled -- their clicks
+-- fall through to the manager, whose OnMouseDown is the right-click dismiss)
+local MoveET_stockMouse = setmetatable({}, { __mode = "k" });
 -- Forward declarations: assigned further below, called from early paths and
 -- mid-file appliers (bound here so they resolve correctly).
 local MoveET_EnsureInit;
@@ -166,6 +172,22 @@ local function MoveET_ApplyPosition()
 	origSetPoint(manager, "TOP", UIParent, "TOP", db.x, db.y);
 end
 
+-- Mouse off, or back to the frame's own stock state (never forced on).
+local function MoveET_SetMouse(frame, enabled)
+	if not (frame and frame.EnableMouse) then
+		return;
+	end
+	local stock = MoveET_stockMouse[frame];
+	if stock == nil then
+		stock = true;
+		if frame.IsMouseEnabled then
+			stock = frame:IsMouseEnabled() and true or false;
+		end
+		MoveET_stockMouse[frame] = stock;
+	end
+	frame:EnableMouse(enabled and stock);
+end
+
 -- Apply the mouse state to the manager and whichever toast is currently
 -- pooled: clickthrough (or disable) means nothing here intercepts clicks.
 local function MoveET_ApplyClickable()
@@ -173,18 +195,12 @@ local function MoveET_ApplyClickable()
 		return;
 	end
 	local enabled = (not db.clickthrough) and (not db.disable);
-	manager:EnableMouse(enabled);
+	MoveET_SetMouse(manager, enabled);
 	local toast = manager.currentDisplayingToast;
 	if toast then
-		if toast.EnableMouse then
-			toast:EnableMouse(enabled);
-		end
-		if toast.TitleTextMouseOverFrame and toast.TitleTextMouseOverFrame.EnableMouse then
-			toast.TitleTextMouseOverFrame:EnableMouse(enabled);
-		end
-		if toast.SubTitleMouseOverFrame and toast.SubTitleMouseOverFrame.EnableMouse then
-			toast.SubTitleMouseOverFrame:EnableMouse(enabled);
-		end
+		MoveET_SetMouse(toast, enabled);
+		MoveET_SetMouse(toast.TitleTextMouseOverFrame, enabled);
+		MoveET_SetMouse(toast.SubTitleMouseOverFrame, enabled);
 	end
 end
 
@@ -204,9 +220,9 @@ local function MoveET_ApplyDisable()
 	MoveET_ApplyClickable();
 end
 
--- Fired after Blizzard's own display work: every DisplayToast ends in
--- Show-or-Hide through Blizzard's own execution, then ours re-applies the
--- saved position and the per-toast mouse state.
+-- Fired after Blizzard's own display work (OnShow for the first toast of a
+-- chain, the fastHide/hideAnim OnFinished for every chained one), then ours
+-- re-applies the saved position and the per-toast mouse state.
 local function MoveET_OnManagerShow()
 	MoveET_ApplyPosition();
 	if db and db.disable then
@@ -280,6 +296,18 @@ end
 -- active and is removed on release, so there is no per-frame cost outside
 -- of it.
 
+-- Cursor in UIParent units: GetCursorPosition is in scale-1 screen units
+-- and the toast spot is a UIParent offset, so divide by UIParent's effective
+-- scale (identical at UI scale 1). Nil when unreadable.
+local function MoveET_CursorXY()
+	local cx, cy = GetCursorPosition();
+	local s = UIParent:GetEffectiveScale();
+	if cx == nil or cy == nil or not s or s <= 0 then
+		return nil;
+	end
+	return cx / s, cy / s;
+end
+
 -- Best-effort OnUpdate detach on our own input frame: always safe.
 MoveET_DetachDrag = function()
 	if MoveET_moveInput then
@@ -330,7 +358,7 @@ MoveET_BeginDrag = function(self)
 	if pw == nil or ph == nil then
 		return;
 	end
-	local cx, cy = GetCursorPosition(); -- already in UI units on this client
+	local cx, cy = MoveET_CursorXY();
 	if cx == nil or cy == nil then
 		return; -- cursor unreadable: refuse the grab without touching anything
 	end
@@ -373,7 +401,7 @@ MoveET_DragUpdate = function()
 		return;
 	end
 	local pw, ph = UIParent:GetSize();
-	local cx, cy = GetCursorPosition(); -- already in UI units on this client
+	local cx, cy = MoveET_CursorXY();
 	if pw == nil or ph == nil or cx == nil or cy == nil then
 		-- cursor unreadable mid-drag: end the gesture without persisting
 		-- anything further (db keeps the last good spot)
@@ -654,15 +682,23 @@ local function MoveET_LoadState()
 	return true;
 end
 
--- Install the display post-hook. Attempted unconditionally; the hook runs
--- after Blizzard's own display work: DisplayToast always ends in
--- Show-or-Hide through Blizzard's own execution, then ours re-applies the
--- saved position and the per-toast mouse state.
+-- Install the display post-hooks. Attempted unconditionally; each runs
+-- after Blizzard's own display work, then ours re-applies the saved position
+-- and the per-toast mouse state. OnShow covers the first toast of a chain;
+-- chained toasts come from the manager's fastHide (hideAnim on the same
+-- path) OnFinished -> ToastingEnded -> DisplayToast with the manager already
+-- shown, where OnShow does not fire.
 local function MoveET_InstallHooks()
 	if MoveET_hooksInstalled then
 		return;
 	end
 	manager:HookScript("OnShow", MoveET_OnManagerShow);
+	for _, key in ipairs({ "fastHide", "hideAnim" }) do
+		local group = manager[key];
+		if group and group.HookScript then
+			group:HookScript("OnFinished", MoveET_OnManagerShow);
+		end
+	end
 	-- installs are attempted once (HookScript chains, so repeats would stack
 	-- duplicate wrappers): if the engine ever refuses, it errors loudly and
 	-- we hear about it.

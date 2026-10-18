@@ -1,5 +1,10 @@
 # Move Event Toast Changelog
 
+## v2.1.2
+- Fixed: with clickthrough on, every toast now lets clicks through — previously only the first toast of a series did.
+- Fixed: with clickthrough off, toasts react to the mouse exactly like the game's own again (right-clicking a toast dismisses it).
+- Fixed: dragging the toast spot in move mode now follows the mouse exactly at every UI scale.
+
 ## v2.1.1
 - Event toasts now work in World of Warcraft: Midnight (12.1.5). Nothing changes in game.
 

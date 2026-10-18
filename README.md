@@ -4,10 +4,10 @@ Super lightweight addon that moves the Event Toast window (the popup near the to
 
 ## Commands
 
-- `/moveet` — open the configuration window
+- `/moveet` — open or close the configuration window
 - `/moveet reset` — restore every setting to the game's defaults
 
-Any other input opens the window as well.
+Any other input does the same.
 
 ## The config window
 
