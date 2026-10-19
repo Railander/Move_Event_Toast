@@ -1,6 +1,6 @@
 # Move Event Toast Changelog
 
-## Unreleased
+## v2.1.4
 - The toast spot (in move mode) and the configuration window now move the moment you press the mouse button, with no dead zone before they start following the cursor.
 
 ## v2.1.3
