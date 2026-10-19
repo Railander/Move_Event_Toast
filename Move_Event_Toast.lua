@@ -237,7 +237,8 @@ end
 -- back from the box: the box follows the db, so reading it would feed our
 -- own movement back into the next update and run away. No StartMoving
 -- anywhere -- the built-in mover would fight the db-driven anchors. The
--- OnUpdate script only exists while a drag is active.
+-- OnUpdate script only exists while a drag is active. The grab starts on the
+-- press itself (no drag threshold), so the spot follows from the first pixel.
 
 -- Cursor in UIParent units: GetCursorPosition is in scale-1 screen units
 -- and the toast spot is a UIParent offset, so divide by UIParent's effective
@@ -331,9 +332,16 @@ local function MoveET_BuildMoveUI()
 	MoveET_moveInput:SetFrameLevel(100);
 	MoveET_moveInput:SetSize(BOX_W, BOX_H);
 	MoveET_moveInput:EnableMouse(true);
-	MoveET_moveInput:RegisterForDrag("LeftButton");
-	MoveET_moveInput:SetScript("OnDragStart", MoveET_BeginDrag);
-	MoveET_moveInput:SetScript("OnDragStop", MoveET_EndDrag);
+	MoveET_moveInput:SetScript("OnMouseDown", function(_, button)
+		if button == "LeftButton" then
+			MoveET_BeginDrag();
+		end
+	end);
+	MoveET_moveInput:SetScript("OnMouseUp", function(_, button)
+		if button == "LeftButton" then
+			MoveET_EndDrag();
+		end
+	end);
 	MoveET_moveInput:Hide();
 end
 
@@ -471,12 +479,13 @@ local function MoveET_BuildWindow()
 	options:SetSize(260, 132);
 	options:SetMovable(true);
 	options:EnableMouse(true);
-	options:RegisterForDrag("LeftButton");
 	options:SetClampedToScreen(true);
-	options:SetScript("OnDragStart", function(self)
-		self:StartMoving();
-	end);
-	options:SetScript("OnDragStop", function(self)
+	-- the window moves from the press itself (no drag threshold)
+	options:SetScript("OnMouseUp", function(self, button)
+		if button ~= "LeftButton" or not self.moving then
+			return;
+		end
+		self.moving = false;
 		self:StopMovingOrSizing();
 		if db then
 			local pw, ph = UIParent:GetSize();
@@ -500,7 +509,13 @@ local function MoveET_BuildWindow()
 
 	-- clicking anywhere outside an edit box (on the window or on the world)
 	-- gives keyboard focus back so the game chat works again
-	options:SetScript("OnMouseDown", MoveET_ClearBoxFocus);
+	options:SetScript("OnMouseDown", function(self, button)
+		MoveET_ClearBoxFocus();
+		if button == "LeftButton" then
+			self.moving = true;
+			self:StartMoving();
+		end
+	end);
 	if WorldFrame then
 		WorldFrame:HookScript("OnMouseUp", function()
 			if options:IsShown() then
@@ -570,7 +585,11 @@ local function MoveET_BuildWindow()
 	end
 
 	options:SetScript("OnShow", refreshWindow);
-	options:SetScript("OnHide", function()
+	options:SetScript("OnHide", function(self)
+		-- hidden mid-move (Escape): finish the move so the spot is saved
+		if self.moving then
+			self:GetScript("OnMouseUp")(self, "LeftButton");
+		end
 		if MoveET_moveModeOn then
 			MoveET_SetMoveMode(false); -- leaving the window also leaves move mode
 		end

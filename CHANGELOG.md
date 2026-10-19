@@ -1,5 +1,8 @@
 # Move Event Toast Changelog
 
+## Unreleased
+- The toast spot (in move mode) and the configuration window now move the moment you press the mouse button, with no dead zone before they start following the cursor.
+
 ## v2.1.3
 - Fixed: the toast now always lands exactly on your saved spot, even for the rare toast types the game places with an extra side offset.
 - Fixed: typing an invalid coordinate (or clicking away mid-edit) no longer leaves the wrong number showing in the box — it shows the saved value again.
