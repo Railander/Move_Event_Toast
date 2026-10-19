@@ -1,5 +1,10 @@
 # Move Event Toast Changelog
 
+## v2.1.3
+- Fixed: the toast now always lands exactly on your saved spot, even for the rare toast types the game places with an extra side offset.
+- Fixed: typing an invalid coordinate (or clicking away mid-edit) no longer leaves the wrong number showing in the box — it shows the saved value again.
+- New: Tab jumps between the X and Y boxes.
+
 ## v2.1.2
 - Fixed: with clickthrough on, every toast now lets clicks through — previously only the first toast of a series did.
 - Fixed: with clickthrough off, toasts react to the mouse exactly like the game's own again (right-clicking a toast dismisses it).

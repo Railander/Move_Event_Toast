@@ -23,25 +23,19 @@
 --
 -- Midnight (12.x) gate discipline, retail flavor only: there is none. Tainted
 -- calls on secret-clean objects serve under any restriction state
--- (live-verified 2026-09-12 on the sibling movers, all six types forced:
--- drags, settings, strata writes, installs, all clean), and nothing this
--- addon touches can become secret-marked (it ingests no unit/combat/aura
--- data -- toast chrome only; Blizzard doesn't mark chrome). So every op
--- below just attempts -- no flag checks, no mark checks, no pcall, no
--- read-back verification, no queues. If the engine ever refuses, it errors
--- LOUDLY (Bugsack, not silence), which is exactly what we want: a silent
--- queue would hide the bug forever, an error gets reported and fixed. The
--- only guards left are crash-safety (nil results abort geometry) and
--- correctness (the already-there early-out keeps default settings from
+-- (live-verified 2026-09-12 on the sibling movers, all six types forced),
+-- and nothing this addon touches can become secret-marked (it ingests no
+-- unit/combat/aura data -- toast chrome only). So every op below just
+-- attempts -- no flag checks, no pcall, no queues. If the engine ever
+-- refuses, it errors LOUDLY (Bugsack, not silence), which is exactly what we
+-- want. The only guards left are crash-safety (nil results abort geometry)
+-- and correctness (the already-there early-out keeps default settings from
 -- touching Blizzard's anchors at all, once-semantics for capture/hooks).
--- Chat tutorial prints best-effort always (a swallowed line under Chat
--- lockdown is harmless -- it is never load-bearing).
 
 local ADDON_NAME = "Move_Event_Toast";
 
 -- Blizzard's EventToastManagerFrame loads from FrameXML before user addons,
--- so it normally exists at file scope; on an unknown layout stay inert (the
--- slash handler retries, so a late-loading manager still boots). Nothing is
+-- so it exists at file scope; on an unknown layout stay inert. Nothing is
 -- read from the frame here: a file-scope GetPoint crashed the whole v1 addon
 -- whenever the manager wasn't ready yet.
 local manager = EventToastManagerFrame;
@@ -65,27 +59,24 @@ local STOCK_X, STOCK_Y = 0, -190;
 local MAX_COORD = 100000;
 local BOX_W, BOX_H = 418, 72; -- the manager's fixedWidth/minimumHeight from the XML
 
--- Rounds to 2 decimals (declared HERE, above every storer: stock capture,
--- reset and sanitize all persist coordinates, and the client's float32
--- layout math hands GetPoint values like -140.00001525879 back -- without
--- rounding that 16-char string overflows a 9-char coordinate box, which then
--- shows its scrolled tail while GetText still reads fine).
+-- Rounds to 2 decimals (declared above every storer: the client's float32
+-- layout math hands GetPoint values like -140.00001525879 back -- stored
+-- raw, that 16-char string overflows a 9-char coordinate box).
 local function MoveET_Round2(v)
 	return math.floor(v * 100 + 0.5) / 100;
 end
 
+-- Shared state. Declared HERE, above every function that reads or writes
+-- it: Lua upvalues bind at closure creation, so a later `local` would leave
+-- earlier paths writing to a same-named global instead.
 local db; -- alias for the Move_Event_Toast SavedVariables table, set on ADDON_LOADED
 local options, refreshWindow; -- config window and its refresher, built below
-
--- Install state. Declared HERE, above every function that reads or writes
--- them: Lua upvalues bind at closure creation, so a later `local` would
--- leave earlier paths writing to a same-named global instead.
 local MoveET_stateLoaded = false; -- db backfilled (pure Lua, always runs)
-local MoveET_hooksInstalled = false; -- post-hook attempted once (HookScript chains)
+local MoveET_hooksInstalled = false; -- post-hooks installed once (HookScript chains)
 local MoveET_captured = false; -- stock captured once (recapturing would adopt our moves)
 local MoveET_anchored = false; -- the manager's own anchor methods are no-ops (placement lock)
 local MoveET_moveModeOn = false; -- move mode: the green box + drag input are shown
-local MoveET_moveDragging = false; -- a drag gesture is in flight (OnUpdate early-returns without it)
+local MoveET_moveDragging = false; -- a drag gesture is in flight
 local MoveET_moveBox; -- green 50% box over the toast spot, marking its rect
 local MoveET_moveInput; -- transparent drag input above the spot
 local MoveET_grabDX, MoveET_grabDY; -- cursor offset from the anchor point at grab time
@@ -93,28 +84,18 @@ local MoveET_grabDX, MoveET_grabDY; -- cursor offset from the anchor point at gr
 -- restores it (stock toast bodies are NOT mouse-enabled -- their clicks
 -- fall through to the manager, whose OnMouseDown is the right-click dismiss)
 local MoveET_stockMouse = setmetatable({}, { __mode = "k" });
--- Forward declarations: assigned further below, called from early paths and
--- mid-file appliers (bound here so they resolve correctly).
-local MoveET_EnsureInit;
-local MoveET_RegisterAddonEvents;
-local MoveET_DetachDrag;
-local MoveET_DragUpdate;
-local MoveET_SetMoveMode;
-local MoveET_BeginDrag;
-local MoveET_EndDrag;
-local MoveET_SyncMoveBox;
-local MoveET_EventFrame; -- listener frame, created at file load below
-
--- stock layout, captured once at init (recapturing later would adopt our
--- own moves as the game's)
-local stockX, stockY = STOCK_X, STOCK_Y; -- the game's own toast placement
--- the manager's own anchor methods, kept privately once captured: every
--- apply below goes through these, so the no-op lock never blocks us
+-- stock layout, captured once at init: the game's own toast placement and
+-- the manager's own anchor methods (every apply goes through these, so the
+-- no-op lock never blocks us)
+local stockX, stockY = STOCK_X, STOCK_Y;
 local origClear, origSetPoint;
 
--- Capture the stock layout: the game's own placement plus the anchor
--- methods the lock later swaps out. Runs once (stock must predate our own
--- moves -- recapturing later would adopt our offset as the game's).
+-- ----------------------------------------------------------------------------
+-- core behavior: every op below just attempts. A call from any path --
+-- hooks, slash, options, events -- runs the same straight-line code
+-- ----------------------------------------------------------------------------
+
+-- Runs once: stock must predate our own moves.
 local function MoveET_CaptureStock()
 	if MoveET_captured then
 		return;
@@ -127,17 +108,9 @@ local function MoveET_CaptureStock()
 	MoveET_captured = true;
 end
 
--- ----------------------------------------------------------------------------
--- core behavior: every op below just attempts. A call from any path --
--- hooks, slash, options, events -- runs the same straight-line code; there
--- is no lock state, no queue, nothing to flush
--- ----------------------------------------------------------------------------
-
 -- While positioned, the manager's own anchor methods are no-ops so neither
--- Blizzard's UpdateAnchor (every DisplayToast resets to TOP 0 -190) nor any
--- other toast mover can displace it behind our back; our own applies go
--- through the privately kept originals. This is a placement lock, not a
--- restriction gate: the swap itself is plain Lua field writes.
+-- Blizzard's UpdateAnchor nor any other toast mover can displace it behind
+-- our back. A placement lock, not a restriction gate: plain field writes.
 local function MoveET_SetLocked(locked)
 	if locked == MoveET_anchored or not MoveET_captured then
 		return;
@@ -154,18 +127,21 @@ end
 
 -- Re-apply the saved position over the manager's current anchor. A nil read
 -- means the engine refused to answer: abort without touching anything (the
--- next organic trigger retries). An already-there anchor is left completely
--- alone, so default settings never touch Blizzard's anchors at all.
+-- next organic trigger retries). An anchor that is already exactly ours (a
+-- single TOP point on UIParent at the saved offset) is left completely
+-- alone, so default settings never touch Blizzard's anchors at all; a
+-- second point (UpdateAnchor's per-texture-kit LEFT offset) always heals.
 local function MoveET_ApplyPosition()
 	if not db or not MoveET_captured then
 		return;
 	end
-	local _, _, _, x, y = manager:GetPoint(1);
+	local point, relativeTo, relativePoint, x, y = manager:GetPoint(1);
 	if x == nil or y == nil then
 		return;
 	end
-	if x == db.x and y == db.y then
-		-- already exactly there: leave Blizzard's anchor completely alone
+	if point == "TOP" and relativePoint == "TOP" and relativeTo == UIParent
+		and manager:GetNumPoints() == 1
+		and MoveET_Round2(x) == db.x and MoveET_Round2(y) == db.y then
 		return;
 	end
 	origClear(manager);
@@ -190,11 +166,13 @@ end
 
 -- Apply the mouse state to the manager and whichever toast is currently
 -- pooled: clickthrough (or disable) means nothing here intercepts clicks.
+-- The manager's own Close button (sticky toasts only) is left alone, so a
+-- toast that never times out can always be dismissed.
 local function MoveET_ApplyClickable()
 	if not db or not MoveET_captured then
 		return;
 	end
-	local enabled = (not db.clickthrough) and (not db.disable);
+	local enabled = not (db.clickthrough or db.disable);
 	MoveET_SetMouse(manager, enabled);
 	local toast = manager.currentDisplayingToast;
 	if toast then
@@ -204,9 +182,9 @@ local function MoveET_ApplyClickable()
 	end
 end
 
--- Apply the disable switch: a disabled manager is faded out and hidden, and
--- a toast arriving while disabled is re-hidden by the OnShow post-hook
--- below. SetAlpha is the designated secret-display sink and always lands.
+-- Apply the disable switch: a disabled manager is faded out and hidden (the
+-- same mid-lifecycle Hide as Blizzard's own right-click dismiss), and a
+-- toast arriving while disabled is re-hidden by the display post-hook.
 local function MoveET_ApplyDisable()
 	if not db or not MoveET_captured then
 		return;
@@ -221,9 +199,8 @@ local function MoveET_ApplyDisable()
 end
 
 -- Fired after Blizzard's own display work (OnShow for the first toast of a
--- chain, the fastHide/hideAnim OnFinished for every chained one), then ours
--- re-applies the saved position and the per-toast mouse state.
-local function MoveET_OnManagerShow()
+-- chain, the fastHide/hideAnim OnFinished for every chained one).
+local function MoveET_OnToastDisplayed()
 	MoveET_ApplyPosition();
 	if db and db.disable then
 		manager:Hide();
@@ -231,43 +208,10 @@ local function MoveET_OnManagerShow()
 	MoveET_ApplyClickable();
 end
 
--- restore every setting to the game's own behavior (db work is pure Lua and
--- always lands). Every saved value goes back, including the config window's
--- own position -- as if the addon was never enabled.
-local function MoveET_Reset()
-	if not db then
-		return;
-	end
-	db.x, db.y = stockX, stockY;
-	db.clickthrough, db.disable = false, false;
-	db.win = { x = 0, y = 0 };
-	MoveET_ApplyPosition(); -- restores the game's own placement
-	MoveET_ApplyDisable(); -- alpha back to 1, mouse back on
-	-- note: reset touches values only -- the window stays open and move mode
-	-- stays on (the box follows the reset spot through refreshWindow below)
-	if options then
-		options:ClearAllPoints();
-		options:SetPoint("CENTER", UIParent, "CENTER", 0, 0);
-	end
-	if refreshWindow then
-		refreshWindow(); -- the window (and the move box) follows the reset
-	end
-	if options and options.xBox then
-		-- force the boxes: they may hold keyboard focus or a format-equal
-		-- string ("-190.0") that the conditional refresh skips, leaving
-		-- stale visible text on the real client
-		options.xBox:ClearFocus();
-		options.yBox:ClearFocus();
-		options.xBox:SetText(tostring(db.x));
-		options.yBox:SetText(tostring(db.y));
-	end
-end
-
 -- v1 carryover: the old slash-command addon saved exactly
 -- { x, y, clickthrough, disable } under this same name. All four keep
--- working verbatim (v1's parser only wrote single-decimal coords, which
--- round-trip cleanly) while the new win key backfills below -- no re-greet,
--- the window is introduced in the changelog instead.
+-- working verbatim while the win key backfills -- no re-greet. Corrupt or
+-- float-noisy values heal here.
 local function MoveET_Sanitize(dbt)
 	dbt.x = MoveET_Round2(tonumber(dbt.x) or stockX);
 	dbt.y = MoveET_Round2(tonumber(dbt.y) or stockY);
@@ -289,12 +233,11 @@ end
 -- lower strata (BACKGROUND, so a live toast overlays it) plus a transparent
 -- drag input above it (TOOLTIP, so grabs land). Both are UIParent siblings
 -- copying the saved anchor, so they also mark the spot while the manager
--- itself is hidden (no toast showing) -- where the next toast would land.
--- The math is cursor-driven, never read back from the box: the box follows
--- the db, so reading it would feed our own movement back into the next
--- update and run away. The OnUpdate script only exists while a drag is
--- active and is removed on release, so there is no per-frame cost outside
--- of it.
+-- itself is hidden (no toast showing). The math is cursor-driven, never read
+-- back from the box: the box follows the db, so reading it would feed our
+-- own movement back into the next update and run away. No StartMoving
+-- anywhere -- the built-in mover would fight the db-driven anchors. The
+-- OnUpdate script only exists while a drag is active.
 
 -- Cursor in UIParent units: GetCursorPosition is in scale-1 screen units
 -- and the toast spot is a UIParent offset, so divide by UIParent's effective
@@ -308,12 +251,67 @@ local function MoveET_CursorXY()
 	return cx / s, cy / s;
 end
 
--- Best-effort OnUpdate detach on our own input frame: always safe.
-MoveET_DetachDrag = function()
+-- Re-anchor the box and the input over the saved spot (own frames).
+local function MoveET_SyncMoveBox()
+	if not MoveET_moveBox or not db then
+		return;
+	end
+	MoveET_moveBox:ClearAllPoints();
+	MoveET_moveBox:SetPoint("TOP", UIParent, "TOP", db.x, db.y);
+	MoveET_moveInput:ClearAllPoints();
+	MoveET_moveInput:SetPoint("TOP", UIParent, "TOP", db.x, db.y);
+end
+
+local function MoveET_StopDrag()
+	MoveET_moveDragging = false;
 	if MoveET_moveInput then
 		MoveET_moveInput:SetScript("OnUpdate", nil);
 	end
-end;
+end
+
+local function MoveET_DragUpdate()
+	if not (MoveET_moveDragging and db) then
+		MoveET_StopDrag();
+		return;
+	end
+	local pw, ph = UIParent:GetSize();
+	local cx, cy = MoveET_CursorXY();
+	if pw == nil or ph == nil or cx == nil or cy == nil then
+		-- cursor unreadable mid-drag: end the gesture, db keeps the last good spot
+		MoveET_StopDrag();
+		return;
+	end
+	db.x = MoveET_Round2(cx - MoveET_grabDX - pw / 2);
+	db.y = MoveET_Round2(cy - MoveET_grabDY - ph);
+	MoveET_ApplyPosition();
+	if refreshWindow then
+		refreshWindow(); -- the boxes (and the move box) update live while dragging
+	end
+end
+
+local function MoveET_BeginDrag()
+	if not db or not MoveET_moveModeOn then
+		return;
+	end
+	-- db already IS the TOP anchor's offset in UI units (ax = pw/2 + x,
+	-- ay = ph + y), so the grab is exact and the spot cannot jump
+	local pw, ph = UIParent:GetSize();
+	local cx, cy = MoveET_CursorXY();
+	if pw == nil or ph == nil or cx == nil or cy == nil then
+		return; -- unreadable: refuse the grab without touching anything
+	end
+	MoveET_grabDX = cx - (pw / 2 + db.x);
+	MoveET_grabDY = cy - (ph + db.y);
+	MoveET_moveDragging = true;
+	MoveET_moveInput:SetScript("OnUpdate", MoveET_DragUpdate);
+end
+
+local function MoveET_EndDrag()
+	if MoveET_moveDragging then
+		MoveET_DragUpdate(); -- exact final position
+	end
+	MoveET_StopDrag();
+end
 
 local function MoveET_BuildMoveUI()
 	if MoveET_moveBox then
@@ -322,6 +320,7 @@ local function MoveET_BuildMoveUI()
 	MoveET_moveBox = CreateFrame("Frame", "Move_Event_ToastMoveBox", UIParent);
 	MoveET_moveBox:SetFrameStrata("BACKGROUND");
 	MoveET_moveBox:SetFrameLevel(1);
+	MoveET_moveBox:SetSize(BOX_W, BOX_H);
 	MoveET_moveBox:EnableMouse(false);
 	local tex = MoveET_moveBox:CreateTexture(nil, "BACKGROUND");
 	tex:SetColorTexture(0, 1, 0, 0.5);
@@ -330,158 +329,140 @@ local function MoveET_BuildMoveUI()
 	MoveET_moveInput = CreateFrame("Frame", "Move_Event_ToastMoveInput", UIParent);
 	MoveET_moveInput:SetFrameStrata("TOOLTIP");
 	MoveET_moveInput:SetFrameLevel(100);
+	MoveET_moveInput:SetSize(BOX_W, BOX_H);
 	MoveET_moveInput:EnableMouse(true);
 	MoveET_moveInput:RegisterForDrag("LeftButton");
-	-- No StartMoving/StopMovingOrSizing anywhere: the built-in mover would
-	-- fight the box's db-driven anchors (each apply pulls the box, each box
-	-- read would feed back into the db). Instead the box is ONLY ever
-	-- db-driven and the db is ONLY ever cursor-driven, so there is a single
-	-- control loop with nothing to fight.
-	MoveET_moveInput:SetScript("OnDragStart", function(self)
-		MoveET_BeginDrag(self);
-	end);
-	MoveET_moveInput:SetScript("OnDragStop", function(self)
-		MoveET_EndDrag(self);
-	end);
+	MoveET_moveInput:SetScript("OnDragStart", MoveET_BeginDrag);
+	MoveET_moveInput:SetScript("OnDragStop", MoveET_EndDrag);
 	MoveET_moveInput:Hide();
 end
 
--- Shared drag endpoints driving the cursor loop.
-MoveET_BeginDrag = function(self)
-	if not db or not MoveET_moveModeOn then
-		return;
+local function MoveET_UpdateMoveButton()
+	if options and options.moveBtn then
+		options.moveBtn:SetText(MoveET_moveModeOn and "stop moving" or "move toast");
 	end
-	-- capture where the cursor grabbed relative to the anchor point: db
-	-- already IS the TOP anchor's offset in UI units, so the grab is exact
-	-- and the spot cannot jump by a single pixel, whatever the scale
-	local pw, ph = UIParent:GetSize();
-	if pw == nil or ph == nil then
-		return;
-	end
-	local cx, cy = MoveET_CursorXY();
-	if cx == nil or cy == nil then
-		return; -- cursor unreadable: refuse the grab without touching anything
-	end
-	MoveET_grabDX = cx - (pw / 2 + db.x);
-	MoveET_grabDY = cy - (ph + db.y);
-	MoveET_moveDragging = true;
-	if MoveET_moveInput then
-		MoveET_moveInput:SetScript("OnUpdate", function() MoveET_DragUpdate(); end);
-	end
-end;
+end
 
-MoveET_EndDrag = function(self)
-	if MoveET_moveDragging then
-		MoveET_DragUpdate(); -- exact final position (drag still active)
-	end
-	MoveET_moveDragging = false;
-	MoveET_DetachDrag();
-end;
-
--- Re-anchor the box and the input over the saved spot. Both are our own
--- frames, so this always serves.
-MoveET_SyncMoveBox = function()
-	if not MoveET_moveBox or not db then
-		return;
-	end
-	MoveET_moveBox:ClearAllPoints();
-	MoveET_moveBox:SetPoint("TOP", UIParent, "TOP", db.x, db.y);
-	MoveET_moveBox:SetSize(BOX_W, BOX_H);
-	MoveET_moveInput:ClearAllPoints();
-	MoveET_moveInput:SetPoint("TOP", UIParent, "TOP", db.x, db.y);
-	MoveET_moveInput:SetSize(BOX_W, BOX_H);
-end;
-
-MoveET_DragUpdate = function()
-	if not MoveET_moveDragging then
-		return; -- idle frame: cheapest possible return, no queries at all
-	end
-	if not db then
-		MoveET_moveDragging = false;
-		return;
-	end
-	local pw, ph = UIParent:GetSize();
-	local cx, cy = MoveET_CursorXY();
-	if pw == nil or ph == nil or cx == nil or cy == nil then
-		-- cursor unreadable mid-drag: end the gesture without persisting
-		-- anything further (db keeps the last good spot)
-		MoveET_moveDragging = false;
-		MoveET_DetachDrag();
-		return;
-	end
-	db.x = MoveET_Round2(cx - MoveET_grabDX - pw / 2);
-	db.y = MoveET_Round2(cy - MoveET_grabDY - ph);
-	MoveET_ApplyPosition();
-	MoveET_SyncMoveBox();
-	if refreshWindow then
-		refreshWindow(); -- the boxes update live while dragging
-	end
-end;
-
-MoveET_SetMoveMode = function(on)
+local function MoveET_SetMoveMode(on)
 	if on then
 		MoveET_BuildMoveUI();
-		if not MoveET_moveBox then
-			return;
-		end
 		MoveET_SyncMoveBox();
 		MoveET_moveBox:Show();
 		MoveET_moveInput:Show();
 		MoveET_moveModeOn = true;
 	else
-		-- exiting is always safe
 		MoveET_moveModeOn = false;
-		MoveET_moveDragging = false;
-		MoveET_DetachDrag();
+		MoveET_StopDrag();
 		if MoveET_moveBox then
 			MoveET_moveBox:Hide();
-		end
-		if MoveET_moveInput then
 			MoveET_moveInput:Hide();
 		end
 	end
-	if options and options.moveBtn then
-		options.moveBtn:SetText(MoveET_moveModeOn and "stop moving" or "move toast");
+	MoveET_UpdateMoveButton();
+end
+
+-- restore every setting to the game's own behavior, including the config
+-- window's own position -- as if the addon was never enabled. The window
+-- stays open and move mode stays on (the box follows the reset spot); a
+-- drag in flight keeps going and its release (cursor truth) wins.
+local function MoveET_Reset()
+	if not db then
+		return;
 	end
-end;
+	db.x, db.y = stockX, stockY;
+	db.clickthrough, db.disable = false, false;
+	db.win = { x = 0, y = 0 };
+	MoveET_ApplyPosition();
+	MoveET_ApplyDisable();
+	if options then
+		options:ClearAllPoints();
+		options:SetPoint("CENTER", UIParent, "CENTER", 0, 0);
+		if options.xBox then
+			-- force the boxes: they may hold keyboard focus or a format-equal
+			-- string ("-190.0") that the conditional refresh skips
+			options.xBox:ClearFocus();
+			options.yBox:ClearFocus();
+			options.xBox:SetText(tostring(db.x));
+			options.yBox:SetText(tostring(db.y));
+		end
+	end
+	if refreshWindow then
+		refreshWindow();
+	end
+end
 
 -- ----------------------------------------------------------------------------
 -- config window, built on init inside a pcall: even if a widget template
 -- is missing in some client build, the toast positioning keeps working
 -- ----------------------------------------------------------------------------
-local function MoveET_MakeLabel(parent, text, fontObject, point, relativeTo, relPoint, x, y)
+local function MoveET_MakeLabel(parent, text, point, relativeTo, relPoint, x, y)
 	local fs = parent:CreateFontString(nil, "OVERLAY");
-	fs:SetFontObject(fontObject);
+	fs:SetFontObject("GameFontNormalLarge");
 	fs:SetText(text);
 	fs:SetPoint(point, relativeTo, relPoint, x, y);
 	return fs;
 end
 
-local function MoveET_MakeEditBox(parent, width, maxLetters, point, relativeTo, relPoint, x, y, onEnter)
-	local box = CreateFrame("EditBox", nil, parent, "InputBoxTemplate");
-	box:SetSize(width, 28);
-	box:SetPoint(point, relativeTo, relPoint, x, y);
-	-- the compact font is load-bearing for the coordinate boxes: the Large
-	-- font makes "-100.00" wider than the box's visible text area and the
-	-- EditBox's scroll/caret handling then clips and misplaces the digits
+local function MoveET_ClearBoxFocus()
+	if options and options.xBox then
+		options.xBox:ClearFocus();
+		options.yBox:ClearFocus();
+	end
+end
+
+-- A coordinate box bound to db[key]. Enter commits a valid number (anything
+-- else is ignored); every way of leaving the box -- Enter, Escape, Tab, a
+-- click elsewhere -- shows the saved value again, so a rejected or
+-- abandoned edit never lingers on screen looking applied.
+local function MoveET_MakeCoordBox(key, x)
+	local box = CreateFrame("EditBox", nil, options, "InputBoxTemplate");
+	box:SetSize(80, 28);
+	box:SetPoint("TOPLEFT", options, "TOPLEFT", x, -34);
+	-- the compact font is load-bearing: the Large font makes "-100.00" wider
+	-- than the visible text area and the EditBox then clips the digits
 	box:SetFontObject("GameFontHighlight");
 	if box.SetTextInsets then
-		-- the search-border left cap protrudes 5px outside the frame
-		box:SetTextInsets(12, 8, 6, 6); -- equal vertical insets center the text
+		-- the template's left cap protrudes 5px outside the frame
+		box:SetTextInsets(12, 8, 6, 6);
 	end
 	box:SetAutoFocus(false);
-	box:SetMaxLetters(maxLetters);
+	box:SetMaxLetters(9);
 	box:SetJustifyH("CENTER");
+	local function ShowSaved(self)
+		if db then
+			self:SetText(tostring(db[key]));
+		end
+	end
+	box:SetScript("OnEnterPressed", function(self)
+		local v = tonumber(self:GetText());
+		if db and v and v >= -MAX_COORD and v <= MAX_COORD then
+			db[key] = MoveET_Round2(v);
+			MoveET_ApplyPosition();
+			if refreshWindow then
+				refreshWindow();
+			end
+		end
+		self:ClearFocus();
+		ShowSaved(self);
+	end);
 	box:SetScript("OnEscapePressed", function(self)
 		self:ClearFocus();
 	end);
-	box:SetScript("OnEnterPressed", function(self)
-		self:ClearFocus();
+	box:SetScript("OnEditFocusLost", ShowSaved);
+	return box;
+end
+
+local function MoveET_MakeCheck(name, label, y, onToggle)
+	local check = CreateFrame("CheckButton", name, options, "UICheckButtonTemplate");
+	check:SetSize(22, 22);
+	check:SetPoint("TOPLEFT", options, "TOPLEFT", 44, y);
+	MoveET_MakeLabel(options, label, "LEFT", check, "RIGHT", 8, 0);
+	check:SetScript("OnClick", function(self)
 		if db then
-			onEnter(self:GetText());
+			onToggle(self:GetChecked() and true or false);
 		end
 	end);
-	return box;
+	return check;
 end
 
 local function MoveET_BuildWindow()
@@ -493,7 +474,7 @@ local function MoveET_BuildWindow()
 	options:RegisterForDrag("LeftButton");
 	options:SetClampedToScreen(true);
 	options:SetScript("OnDragStart", function(self)
-		self:StartMoving(); -- own frame: always servable
+		self:StartMoving();
 	end);
 	options:SetScript("OnDragStop", function(self)
 		self:StopMovingOrSizing();
@@ -519,28 +500,15 @@ local function MoveET_BuildWindow()
 
 	-- clicking anywhere outside an edit box (on the window or on the world)
 	-- gives keyboard focus back so the game chat works again
-	options:SetScript("OnMouseDown", function()
-		if options.xBox then
-			options.xBox:ClearFocus();
-		end
-		if options.yBox then
-			options.yBox:ClearFocus();
-		end
-	end);
+	options:SetScript("OnMouseDown", MoveET_ClearBoxFocus);
 	if WorldFrame then
 		WorldFrame:HookScript("OnMouseUp", function()
-			if options and options:IsShown() then
-				if options.xBox then
-					options.xBox:ClearFocus();
-				end
-				if options.yBox then
-					options.yBox:ClearFocus();
-				end
+			if options:IsShown() then
+				MoveET_ClearBoxFocus();
 			end
 		end);
 	end
 
-	-- close
 	local close = CreateFrame("Button", nil, options, "UIPanelCloseButton");
 	close:SetPoint("TOPRIGHT", options, "TOPRIGHT", -4, -4);
 	close:SetScript("OnClick", function()
@@ -548,8 +516,7 @@ local function MoveET_BuildWindow()
 	end);
 
 	-- move mode: only while it is on is the toast spot drag-movable; the box
-	-- doubles as the position preview (the manager hides with no toast to
-	-- show). It sits centered at the top of the window
+	-- doubles as the position preview (the manager hides with no toast)
 	options.moveBtn = CreateFrame("Button", nil, options, "UIPanelButtonTemplate");
 	options.moveBtn:SetSize(140, 22); -- wide enough for the Large-font label
 	if options.moveBtn.SetNormalFontObject then
@@ -560,69 +527,34 @@ local function MoveET_BuildWindow()
 	options.moveBtn:SetText("move toast");
 	options.moveBtn:SetPoint("TOP", options, "TOP", 0, -6);
 	options.moveBtn:SetScript("OnClick", function()
-		if MoveET_moveModeOn then
-			MoveET_SetMoveMode(false);
-		else
-			MoveET_SetMoveMode(true);
-		end
+		MoveET_SetMoveMode(not MoveET_moveModeOn);
 	end);
 
 	-- position: x/y coordinates with two decimal places, side by side; the
 	-- labels are edge-anchored to their boxes so they sit on the same row
-	options.xBox = MoveET_MakeEditBox(options, 80, 9, "TOPLEFT", options, "TOPLEFT", 44, -34, function(v)
-		v = tonumber(v);
-		if v and v >= -MAX_COORD and v <= MAX_COORD then
-			db.x = MoveET_Round2(v);
-			MoveET_ApplyPosition(); -- db already correct, frame follows
-			if refreshWindow then
-				refreshWindow();
-			end
-		end
-	end);
-	options.xLabel = MoveET_MakeLabel(options, "X", "GameFontNormalLarge", "RIGHT", options.xBox, "LEFT", -12, 0);
-	options.yBox = MoveET_MakeEditBox(options, 80, 9, "TOPLEFT", options, "TOPLEFT", 160, -34, function(v)
-		v = tonumber(v);
-		if v and v >= -MAX_COORD and v <= MAX_COORD then
-			db.y = MoveET_Round2(v);
-			MoveET_ApplyPosition(); -- db already correct, frame follows
-			if refreshWindow then
-				refreshWindow();
-			end
-		end
-	end);
-	options.yLabel = MoveET_MakeLabel(options, "Y", "GameFontNormalLarge", "RIGHT", options.yBox, "LEFT", -12, 0);
+	options.xBox = MoveET_MakeCoordBox("x", 44);
+	options.xLabel = MoveET_MakeLabel(options, "X", "RIGHT", options.xBox, "LEFT", -12, 0);
+	options.yBox = MoveET_MakeCoordBox("y", 160);
+	options.yLabel = MoveET_MakeLabel(options, "Y", "RIGHT", options.yBox, "LEFT", -12, 0);
+	-- Tab hops between the two boxes (the edit is shown as saved on leave)
+	options.xBox:SetScript("OnTabPressed", function() options.yBox:SetFocus(); end);
+	options.yBox:SetScript("OnTabPressed", function() options.xBox:SetFocus(); end);
 
 	-- clickthrough: nothing here intercepts mouse clicks
-	options.clickBox = CreateFrame("CheckButton", "Move_Event_ToastClickthrough", options, "UICheckButtonTemplate");
-	options.clickBox:SetSize(22, 22);
-	options.clickBox:SetPoint("TOPLEFT", options, "TOPLEFT", 44, -70);
-	MoveET_MakeLabel(options, "clickthrough", "GameFontNormalLarge", "LEFT", options.clickBox, "RIGHT", 8, 0);
-	options.clickBox:SetScript("OnClick", function(self)
-		if not db then
-			return;
-		end
-		db.clickthrough = self:GetChecked() and true or false;
-		MoveET_ApplyClickable(); -- db already correct, frame follows
+	options.clickBox = MoveET_MakeCheck("Move_Event_ToastClickthrough", "clickthrough", -70, function(on)
+		db.clickthrough = on;
+		MoveET_ApplyClickable();
 	end);
-
 	-- disable: no toasts at all while set
-	options.disableBox = CreateFrame("CheckButton", "Move_Event_ToastDisable", options, "UICheckButtonTemplate");
-	options.disableBox:SetSize(22, 22);
-	options.disableBox:SetPoint("TOPLEFT", options, "TOPLEFT", 44, -98);
-	MoveET_MakeLabel(options, "disable toasts", "GameFontNormalLarge", "LEFT", options.disableBox, "RIGHT", 8, 0);
-	options.disableBox:SetScript("OnClick", function(self)
-		if not db then
-			return;
-		end
-		db.disable = self:GetChecked() and true or false;
-		MoveET_ApplyDisable(); -- db already correct, frame follows
+	options.disableBox = MoveET_MakeCheck("Move_Event_ToastDisable", "disable toasts", -98, function(on)
+		db.disable = on;
+		MoveET_ApplyDisable();
 	end);
 
 	function refreshWindow()
-		if not db or not options.xBox then
+		if not db then
 			return;
 		end
-		-- own frames throughout: every write below serves.
 		if tonumber(options.xBox:GetText()) ~= db.x then
 			options.xBox:SetText(tostring(db.x));
 		end
@@ -631,19 +563,13 @@ local function MoveET_BuildWindow()
 		end
 		options.clickBox:SetChecked(db.clickthrough);
 		options.disableBox:SetChecked(db.disable);
-		if options.moveBtn then
-			options.moveBtn:SetText(MoveET_moveModeOn and "stop moving" or "move toast");
-		end
+		MoveET_UpdateMoveButton();
 		if MoveET_moveModeOn then
-			MoveET_SyncMoveBox(); -- the box follows typed/reset changes too
+			MoveET_SyncMoveBox(); -- the box follows typed/reset/dragged changes too
 		end
 	end
 
-	options:SetScript("OnShow", function()
-		if refreshWindow then
-			refreshWindow();
-		end
-	end);
+	options:SetScript("OnShow", refreshWindow);
 	options:SetScript("OnHide", function()
 		if MoveET_moveModeOn then
 			MoveET_SetMoveMode(false); -- leaving the window also leaves move mode
@@ -652,39 +578,29 @@ local function MoveET_BuildWindow()
 end
 
 -- ----------------------------------------------------------------------------
--- Load (pure Lua, always) + init (attempt everything at file scope, on load,
--- and on slash)
+-- Load (pure Lua) + init (file scope, ADDON_LOADED and slash)
 -- ----------------------------------------------------------------------------
 
--- Backfill the db from SavedVariables. Pure Lua table work only. Returns
--- false on a missing manager (inert before touching SavedVariables).
--- Idempotent. The first-run tutorial prints best-effort, chat lockdown or
--- not -- it is never load-bearing.
+-- Backfill the db from SavedVariables. Pure Lua table work, idempotent. The
+-- first-run tutorial prints best-effort (never load-bearing).
 local function MoveET_LoadState()
 	if MoveET_stateLoaded then
-		return true;
+		return;
 	end
-	if not manager then
-		return false;
-	end
-
 	local freshDB = type(_G[ADDON_NAME]) ~= "table";
-	db = _G[ADDON_NAME];
 	if freshDB then
-		db = {}; -- start from the game's own placement (also heals a corrupted non-table save)
-		_G[ADDON_NAME] = db; -- first session: publish it so it gets saved
+		_G[ADDON_NAME] = {}; -- first session (also heals a corrupted non-table save)
 	end
+	db = _G[ADDON_NAME];
 	MoveET_Sanitize(db);
 	if freshDB then
 		MoveET_instructions();
 	end
 	MoveET_stateLoaded = true;
-	return true;
 end
 
--- Install the display post-hooks. Attempted unconditionally; each runs
--- after Blizzard's own display work, then ours re-applies the saved position
--- and the per-toast mouse state. OnShow covers the first toast of a chain;
+-- Install the display post-hooks once (HookScript chains, so repeats would
+-- stack duplicate wrappers). OnShow covers the first toast of a chain;
 -- chained toasts come from the manager's fastHide (hideAnim on the same
 -- path) OnFinished -> ToastingEnded -> DisplayToast with the manager already
 -- shown, where OnShow does not fire.
@@ -692,31 +608,23 @@ local function MoveET_InstallHooks()
 	if MoveET_hooksInstalled then
 		return;
 	end
-	manager:HookScript("OnShow", MoveET_OnManagerShow);
+	manager:HookScript("OnShow", MoveET_OnToastDisplayed);
 	for _, key in ipairs({ "fastHide", "hideAnim" }) do
 		local group = manager[key];
 		if group and group.HookScript then
-			group:HookScript("OnFinished", MoveET_OnManagerShow);
+			group:HookScript("OnFinished", MoveET_OnToastDisplayed);
 		end
 	end
-	-- installs are attempted once (HookScript chains, so repeats would stack
-	-- duplicate wrappers): if the engine ever refuses, it errors loudly and
-	-- we hear about it.
 	MoveET_hooksInstalled = true;
 end
 
--- Setup, run at file scope (pre-SV: registers, captures, hooks, builds)
--- and again on ADDON_LOADED and slash (cheap idempotent re-entry:
--- registration no-ops, capture/hooks run once, applies re-assert).
--- The first apply waits for state (db guard below).
-MoveET_EnsureInit = function()
-	MoveET_RegisterAddonEvents();
+-- Cheap idempotent (re-)entry: capture/hooks/window run once, applies
+-- re-assert. The first apply waits for state.
+local function MoveET_EnsureInit()
 	MoveET_CaptureStock();
 	MoveET_InstallHooks();
 	if not options then
-		pcall(function()
-			MoveET_BuildWindow();
-		end);
+		pcall(MoveET_BuildWindow);
 	end
 	if MoveET_stateLoaded then
 		MoveET_ApplyPosition(); -- positions over the login anchor
@@ -725,65 +633,36 @@ MoveET_EnsureInit = function()
 		if options then
 			options:ClearAllPoints();
 			options:SetPoint("CENTER", UIParent, "CENTER", db.win.x, db.win.y);
-			if refreshWindow then
-				refreshWindow();
-			end
 		end
-	end
-end;
-
--- ----------------------------------------------------------------------------
--- login and persist through sessions functionality
--- ----------------------------------------------------------------------------
-local function MoveET_OnEvent(self, event, arg1)
-	if event == "ADDON_LOADED" then
-		if arg1 == ADDON_NAME then
-			if MoveET_LoadState() then
-				MoveET_EnsureInit();
-			end
-			-- unregister LAST: EnsureInit re-registers everything above,
-			-- so unsubscribing first would resurrect in the same tick.
-			-- The handler is idempotent anyway, so a lingering
-			-- registration would be harmless regardless.
-			self:UnregisterEvent("ADDON_LOADED");
+		if refreshWindow then
+			refreshWindow();
 		end
 	end
 end
 
--- All event installs funnel through here. Re-registering is a no-op and the
--- script is simply replaced, so repeated EnsureInit calls stay cheap.
--- Assigned here (not a `local function`) because EnsureInit above calls it
--- before this line runs; the forward declaration near the top binds the name.
-MoveET_RegisterAddonEvents = function()
-	if not MoveET_EventFrame then return end
-	MoveET_EventFrame:RegisterEvent("ADDON_LOADED");
-	MoveET_EventFrame:SetScript("OnEvent", MoveET_OnEvent);
-end;
+local MoveET_EventFrame = CreateFrame("Frame", "Move_Event_ToastEventFrame");
+MoveET_EventFrame:SetScript("OnEvent", function(self, event, arg1)
+	if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
+		self:UnregisterEvent("ADDON_LOADED");
+		MoveET_LoadState();
+		MoveET_EnsureInit();
+	end
+end);
+MoveET_EventFrame:RegisterEvent("ADDON_LOADED");
 
-MoveET_EventFrame = CreateFrame("Frame", "Move_Event_ToastEventFrame");
-
--- File scope runs before SavedVariables land: register (so our own
--- ADDON_LOADED is heard), capture stock, install hooks, build the window.
--- The first apply waits for state in the ADDON_LOADED handler below.
+-- File scope runs before SavedVariables land: capture stock, install hooks,
+-- build the window. The first apply waits for ADDON_LOADED.
 MoveET_EnsureInit();
 
 -- ----------------------------------------------------------------------------
--- slash command functionality: bare /moveet (or anything unrecognized)
--- toggles the config window, /moveet reset restores the game's defaults
+-- slash command: bare /moveet (or anything unrecognized) toggles the config
+-- window, /moveet reset restores the game's defaults
 -- ----------------------------------------------------------------------------
 SLASH_MOVEET1 = "/moveet";
 SlashCmdList.MOVEET = function(msg)
-	if not MoveET_stateLoaded then
-		if not MoveET_LoadState() then
-			return; -- unknown layout: inert, SavedVariables untouched
-		end
-	end
-	-- re-entry is cheap and idempotent: a missed ADDON_LOADED (refused
-	-- registration) resumes here.
+	-- a missed ADDON_LOADED resumes here (state + init are idempotent)
+	MoveET_LoadState();
 	MoveET_EnsureInit();
-	if not db then
-		return; -- settings are not loaded yet
-	end
 	msg = string.lower(string.match(msg or "", "^%s*(.-)%s*$") or "");
 	if msg == "reset" then
 		MoveET_Reset();
