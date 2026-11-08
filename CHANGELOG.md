@@ -1,5 +1,11 @@
 # Move Event Toast Changelog
 
+## v2.1.5
+- Fixed: turning toasts off while a toast that waits for you to close it was showing could leave the toast system stuck until `/reload` — no more toasts and no zone text. Disabling now dismisses the current toast the same way the game's own right-click does.
+- Fixed: with clickthrough on, Great Vault / weekly reward toasts no longer keep intercepting mouse clicks.
+- Fixed: closing the configuration window now releases keyboard focus from the X/Y boxes.
+- Fixed: hand-edited or corrupt saved coordinates and window positions (NaN or infinite values) heal to the defaults instead of poisoning the layout.
+
 ## v2.1.4
 - The toast spot (in move mode) and the configuration window now move the moment you press the mouse button, with no dead zone before they start following the cursor.
 

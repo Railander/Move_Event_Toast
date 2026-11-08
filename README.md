@@ -13,7 +13,7 @@ Any other input does the same.
 
 - **move toast** — turn on move mode, then drag the toast spot anywhere; a green box marks its exact spot (even while no toast is showing). Closing the window leaves move mode.
 - **X / Y** — move the toast spot, with boxes for exact values (or drag it in move mode)
-- **clickthrough** — toasts stop intercepting mouse clicks
+- **clickthrough** — toasts stop intercepting mouse clicks; close buttons and interactive buttons inside a toast stay clickable, so you can always dismiss or use one
 - **disable toasts** — no event toasts at all while set
 
 ## Compatibility

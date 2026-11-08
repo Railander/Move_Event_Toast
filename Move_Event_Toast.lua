@@ -9,7 +9,7 @@
 -- custom offsets), and only there. Once positioned, the manager's own anchor
 -- methods become no-ops (the originals are kept privately and every apply
 -- goes through them), so no Blizzard re-anchor, UI reload pass or other
--- toast mover can displace it -- the MFC anchor-lock pattern. Post-hooks on
+-- toast mover can displace it -- a placement lock. Post-hooks on
 -- the manager's OnShow (the first toast of a chain: the manager was hidden)
 -- and on its fastHide/hideAnim OnFinished (every chained toast: those run
 -- ToastingEnded -> DisplayToast while the manager stays shown, so OnShow
@@ -23,27 +23,27 @@
 --
 -- Midnight (12.x) gate discipline, retail flavor only: there is none. Tainted
 -- calls on secret-clean objects serve under any restriction state
--- (live-verified 2026-09-12 on the sibling movers, all six types forced),
--- and nothing this addon touches can become secret-marked (it ingests no
--- unit/combat/aura data -- toast chrome only). So every op below just
--- attempts -- no flag checks, no pcall, no queues. If the engine ever
--- refuses, it errors LOUDLY (Bugsack, not silence), which is exactly what we
--- want. The only guards left are crash-safety (nil results abort geometry)
--- and correctness (the already-there early-out keeps default settings from
+-- (live-verified on retail with every restriction type forced), and nothing
+-- this addon touches can become secret-marked (it ingests no unit/combat/aura
+-- data -- toast chrome only). So every op below just attempts -- no flag
+-- checks, no pcall, no queues. If the engine ever refuses, it errors LOUDLY
+-- (the player's error display, not silence), which is exactly what we want.
+-- The only guards left are crash-safety (nil results abort geometry) and
+-- correctness (the already-there early-out keeps default settings from
 -- touching Blizzard's anchors at all, once-semantics for capture/hooks).
 
 local ADDON_NAME = "Move_Event_Toast";
 
 -- Blizzard's EventToastManagerFrame loads from FrameXML before user addons,
 -- so it exists at file scope; on an unknown layout stay inert. Nothing is
--- read from the frame here: a file-scope GetPoint crashed the whole v1 addon
+-- read from the frame here: the old version's file-scope GetPoint crashed
 -- whenever the manager wasn't ready yet.
 local manager = EventToastManagerFrame;
 if not manager then
 	return;
 end
 
--- ingame instructions, in the same scheme as the other Move_* addons
+-- ingame instructions
 local exitColor = "|r";
 local colorOrange = "|cFFDF9F1F";
 local function MoveET_instructions()
@@ -64,6 +64,13 @@ local BOX_W, BOX_H = 418, 72; -- the manager's fixedWidth/minimumHeight from the
 -- raw, that 16-char string overflows a 9-char coordinate box).
 local function MoveET_Round2(v)
 	return math.floor(v * 100 + 0.5) / 100;
+end
+
+-- NaN and infinities survive tonumber() and Round2 on a hand-edited save,
+-- and every comparison against NaN is false: without this check a corrupt
+-- coordinate or window slot reaches SetPoint instead of healing.
+local function MoveET_Finite(v)
+	return v == v and v ~= math.huge and v ~= -math.huge;
 end
 
 -- Shared state. Declared HERE, above every function that reads or writes
@@ -111,18 +118,13 @@ end
 -- While positioned, the manager's own anchor methods are no-ops so neither
 -- Blizzard's UpdateAnchor nor any other toast mover can displace it behind
 -- our back. A placement lock, not a restriction gate: plain field writes.
-local function MoveET_SetLocked(locked)
-	if locked == MoveET_anchored or not MoveET_captured then
+local function MoveET_SetLocked()
+	if MoveET_anchored or not MoveET_captured then
 		return;
 	end
-	MoveET_anchored = locked;
-	if locked then
-		manager.ClearAllPoints = function() end;
-		manager.SetPoint = function() end;
-	else
-		manager.ClearAllPoints = origClear;
-		manager.SetPoint = origSetPoint;
-	end
+	MoveET_anchored = true;
+	manager.ClearAllPoints = function() end;
+	manager.SetPoint = function() end;
 end
 
 -- Re-apply the saved position over the manager's current anchor. A nil read
@@ -166,8 +168,9 @@ end
 
 -- Apply the mouse state to the manager and whichever toast is currently
 -- pooled: clickthrough (or disable) means nothing here intercepts clicks.
--- The manager's own Close button (sticky toasts only) is left alone, so a
--- toast that never times out can always be dismissed.
+-- The toast's own close affordances (the manager's Hide button and the
+-- scoreboard's Close button) are left alone, so a toast that never times out
+-- can always be dismissed.
 local function MoveET_ApplyClickable()
 	if not db or not MoveET_captured then
 		return;
@@ -179,18 +182,38 @@ local function MoveET_ApplyClickable()
 		MoveET_SetMouse(toast, enabled);
 		MoveET_SetMouse(toast.TitleTextMouseOverFrame, enabled);
 		MoveET_SetMouse(toast.SubTitleMouseOverFrame, enabled);
+		-- weekly-reward toasts put the click target on a Contents child
+		-- (EventToastManager.xml), not on the body; without this the whole
+		-- Great Vault toast keeps swallowing clicks under clickthrough
+		MoveET_SetMouse(toast.Contents, enabled);
 	end
 end
 
--- Apply the disable switch: a disabled manager is faded out and hidden (the
--- same mid-lifecycle Hide as Blizzard's own right-click dismiss), and a
--- toast arriving while disabled is re-hidden by the display post-hook.
+-- End the toast that is currently playing before hiding the manager, the
+-- same dismiss Blizzard's own right-click performs (CloseActiveToasts +
+-- Hide). Merely hiding the manager is not enough: a toast that never times
+-- out is not auto-dismissed, and the expandable scenario toast has no OnHide
+-- recovery of its own, so currentDisplayingToast can stay set -- after which
+-- the manager ignores every later DISPLAY_EVENT_TOASTS and ZoneText stays
+-- suppressed until /reload. (The scoreboard happens to re-trigger
+-- CloseActiveToasts from its own OnHide; that is stock behavior this addon
+-- must not depend on.)
+local function MoveET_CloseActiveToast()
+	if manager.currentDisplayingToast and manager.CloseActiveToasts then
+		manager:CloseActiveToasts();
+	end
+end
+
+-- Apply the disable switch: a disabled manager is faded out and hidden, and
+-- a toast arriving while disabled is dismissed and re-hidden by the display
+-- post-hook.
 local function MoveET_ApplyDisable()
 	if not db or not MoveET_captured then
 		return;
 	end
 	if db.disable then
 		manager:SetAlpha(0);
+		MoveET_CloseActiveToast();
 		manager:Hide();
 	else
 		manager:SetAlpha(1);
@@ -203,6 +226,7 @@ end
 local function MoveET_OnToastDisplayed()
 	MoveET_ApplyPosition();
 	if db and db.disable then
+		MoveET_CloseActiveToast();
 		manager:Hide();
 	end
 	MoveET_ApplyClickable();
@@ -215,8 +239,8 @@ end
 local function MoveET_Sanitize(dbt)
 	dbt.x = MoveET_Round2(tonumber(dbt.x) or stockX);
 	dbt.y = MoveET_Round2(tonumber(dbt.y) or stockY);
-	if dbt.x < -MAX_COORD or dbt.x > MAX_COORD then dbt.x = stockX; end
-	if dbt.y < -MAX_COORD or dbt.y > MAX_COORD then dbt.y = stockY; end
+	if not MoveET_Finite(dbt.x) or dbt.x < -MAX_COORD or dbt.x > MAX_COORD then dbt.x = stockX; end
+	if not MoveET_Finite(dbt.y) or dbt.y < -MAX_COORD or dbt.y > MAX_COORD then dbt.y = stockY; end
 	dbt.clickthrough = dbt.clickthrough and true or false;
 	dbt.disable = dbt.disable and true or false;
 	if type(dbt.win) ~= "table" then
@@ -224,10 +248,12 @@ local function MoveET_Sanitize(dbt)
 	end
 	dbt.win.x = MoveET_Round2(tonumber(dbt.win.x) or 0);
 	dbt.win.y = MoveET_Round2(tonumber(dbt.win.y) or 0);
+	if not MoveET_Finite(dbt.win.x) then dbt.win.x = 0; end
+	if not MoveET_Finite(dbt.win.y) then dbt.win.y = 0; end
 end
 
 -- ----------------------------------------------------------------------------
--- move mode: drag the toast spot, following the MFC/MRM drag proxy pattern
+-- move mode: drag the toast spot with a cursor-driven proxy
 -- ----------------------------------------------------------------------------
 -- Entering move mode shows a green 50% box exactly over the toast spot at a
 -- lower strata (BACKGROUND, so a live toast overlays it) plus a transparent
@@ -247,6 +273,9 @@ local function MoveET_CursorXY()
 	local cx, cy = GetCursorPosition();
 	local s = UIParent:GetEffectiveScale();
 	if cx == nil or cy == nil or not s or s <= 0 then
+		return nil;
+	end
+	if not (MoveET_Finite(cx) and MoveET_Finite(cy) and MoveET_Finite(s)) then
 		return nil;
 	end
 	return cx / s, cy / s;
@@ -493,7 +522,12 @@ local function MoveET_BuildWindow()
 			if pw == nil or ph == nil or cx == nil or cy == nil then
 				return;
 			end
-			db.win = { x = MoveET_Round2(cx - pw / 2), y = MoveET_Round2(cy - ph / 2) };
+			local wx = MoveET_Round2(cx - pw / 2);
+			local wy = MoveET_Round2(cy - ph / 2);
+			if not (MoveET_Finite(wx) and MoveET_Finite(wy)) then
+				return; -- unreadable geometry: keep the last good slot
+			end
+			db.win = { x = wx, y = wy };
 			self:ClearAllPoints();
 			self:SetPoint("CENTER", UIParent, "CENTER", db.win.x, db.win.y);
 		end
@@ -518,7 +552,7 @@ local function MoveET_BuildWindow()
 	end);
 	if WorldFrame then
 		WorldFrame:HookScript("OnMouseUp", function()
-			if options:IsShown() then
+			if options and options:IsShown() then
 				MoveET_ClearBoxFocus();
 			end
 		end);
@@ -545,7 +579,7 @@ local function MoveET_BuildWindow()
 		MoveET_SetMoveMode(not MoveET_moveModeOn);
 	end);
 
-	-- position: x/y coordinates with two decimal places, side by side; the
+	-- position: x/y coordinates rounded to two decimals, side by side; the
 	-- labels are edge-anchored to their boxes so they sit on the same row
 	options.xBox = MoveET_MakeCoordBox("x", 44);
 	options.xLabel = MoveET_MakeLabel(options, "X", "RIGHT", options.xBox, "LEFT", -12, 0);
@@ -586,6 +620,9 @@ local function MoveET_BuildWindow()
 
 	options:SetScript("OnShow", refreshWindow);
 	options:SetScript("OnHide", function(self)
+		-- closing with a coordinate box focused must hand the keyboard back
+		-- (a hidden focused EditBox keeps swallowing the player's typing)
+		MoveET_ClearBoxFocus();
 		-- hidden mid-move (Escape): finish the move so the spot is saved
 		if self.moving then
 			self:GetScript("OnMouseUp")(self, "LeftButton");
@@ -648,7 +685,7 @@ local function MoveET_EnsureInit()
 	if MoveET_stateLoaded then
 		MoveET_ApplyPosition(); -- positions over the login anchor
 		MoveET_ApplyDisable(); -- saved clickthrough/disable from the start
-		MoveET_SetLocked(true); -- Blizzard re-anchors stop here from now on
+		MoveET_SetLocked(); -- Blizzard re-anchors stop here from now on
 		if options then
 			options:ClearAllPoints();
 			options:SetPoint("CENTER", UIParent, "CENTER", db.win.x, db.win.y);
